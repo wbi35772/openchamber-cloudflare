@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>OpenChamber panel harness</title>
+  <style>
+    html, body { margin: 0; height: 100%; font: 12px/1.4 system-ui, sans-serif; }
+    #wrap { display: flex; height: 100%; }
+    iframe { flex: 1; border: 0; border-right: 1px solid #ccc; background: #fff; }
+    aside { width: 320px; padding: 10px; overflow: auto; background: #f4f6f8; }
+    pre { white-space: pre-wrap; word-break: break-all; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <iframe id="panel" title="panel under test"></iframe>
+    <aside>
+      <strong>harness log</strong>
+      <pre id="log">[]</pre>
+    </aside>
+  </div>
+  <script>
+    (function () {
+      'use strict';
+      var CHANNEL = 'openchamber.sdk';
+      var WIRE = 1;
+      var frame = document.getElementById('panel');
+      var logNode = document.getElementById('log');
+      var log = [];
+
+      var accounts = [
+        { id: 'acc_demo', label: 'Acme 主账号', proxyPort: 24001, tags: ['prod', 'eu'], enabled: true },
+      ];
+      var config = {
+        apiBase: 'https://api.cloudflare.com/client/v4',
+        proxyHost: '127.0.0.1',
+        proxyAuth: null,
+        portStart: 24001,
+        portEnd: 24250,
+        risk: { rps: 4, burst: 4, windowLimit: 950, windowMs: 300000, jitter: { minMs: 800, maxMs: 3200 } },
+      };
+      var snapshots = {
+        acc_demo: { accountId: 'acc_demo', status: 'ACTIVE', healthScore: 98, window: { used: 120, limit: 950 } },
+      };
+      window.__METHODS = [];
+      window.__ERRORS = [];
+      window.__accounts = function () { return JSON.parse(JSON.stringify(accounts)); };
+      window.__config = function () { return JSON.parse(JSON.stringify(config)); };
+      window.__CALLS = [];
+
+      function record(value) {
+        log.push(value);
+        logNode.textContent = JSON.stringify(log, null, 2);
+      }
+
+      function nextPort() {
+        var used = accounts.map(function (a) { return a.proxyPort; });
+        for (var p = config.portStart; p <= config.portEnd; p += 1) if (used.indexOf(p) < 0) return p;
+        return config.portStart;
+      }
+
+      function rpc(method, params) {
+        window.__METHODS.push(method);
+        window.__CALLS.push({ method: method, params: params });
+        switch (method) {
+          case 'cf.matrix.status':
+            return { dataDir: 'C:\\Users\\demo\\.openchamber-cf-matrix-channel', configPath: 'C:\\Users\\demo\\.openchamber-cf-matrix-channel\\cf-matrix.config.json', masterKeySource: 'generated', masterKeyPath: 'C:\\Users\\demo\\.openchamber-cf-matrix-channel\\master.key', version: '0.1.0' };
+          case 'cf.account.list':
+            return { accounts: accounts.slice() };
+          case 'cf.risk.report':
+            return { accounts: accounts.map(function (a) { return snapshots[a.id] || { accountId: a.id, status: 'ACTIVE', healthScore: 100, window: { used: 0, limit: 950 } }; }), bindings: [] };
+          case 'cf.config.get':
+            return { config: config, configPath: 'C:\\Users\\demo\\config.json', dataDir: 'C:\\Users\\demo', masterKeySource: 'generated', masterKeyPath: 'C:\\Users\\demo\\master.key' };
+          case 'cf.config.patch':
+            config = Object.assign({}, config, params || {});
+            return { config: config, configPath: 'C:\\Users\\demo\\config.json' };
+          case 'cf.account.add': {
+            var profile = {
+              id: 'acc_' + (accounts.length + 1),
+              label: params.label,
+              proxyPort: params.proxyPort || nextPort(),
+              tags: params.tags || [],
+              enabled: params.enabled !== false,
+            };
+            accounts.push(profile);
+            snapshots[profile.id] = { accountId: profile.id, status: 'ACTIVE', healthScore: 100, window: { used: 0, limit: 950 } };
+            return profile;
+          }
+          case 'cf.account.verify':
+            return { ok: true, status: 'active' };
+          case 'cf.proxy.probe':
+            return { ip: '203.0.113.7', proxyPort: 24001 };
+          case 'cf.account.update': {
+            var target = accounts.find(function (a) { return a.id === params.id; });
+            if (target && params.patch) Object.assign(target, params.patch);
+            return target;
+          }
+          case 'cf.account.remove':
+            accounts = accounts.filter(function (a) { return a.id !== params.id; });
+            return { removed: true };
+          default:
+            throw new Error('unknown method ' + method);
+        }
+      }
+
+      function answer(message) {
+        var payload = message.payload || {};
+        var body;
+        try {
+          var parsed = JSON.parse(payload.body || '{}');
+          var result = payload.path === '/rpc' ? rpc(parsed.method, parsed.params || {}) : {};
+          body = JSON.stringify({ ok: true, result: result });
+        } catch (error) {
+          window.__ERRORS.push(String(error && error.message));
+          body = JSON.stringify({ ok: false, error: { code: 'ERR_MOCK', message: String(error && error.message) } });
+        }
+        frame.contentWindow.postMessage({ channel: CHANNEL, v: WIRE, id: message.id, ok: true, payload: { status: 200, body: body } }, '*');
+      }
+
+      window.addEventListener('message', function (event) {
+        if (event.source !== frame.contentWindow) return;
+        var data = event.data || {};
+        if (data.channel !== CHANNEL || data.v !== WIRE) return;
+        record({ type: data.type || 'answer', id: data.id || null, method: data.payload && data.payload.path ? data.payload.path : undefined });
+        if (data.type === 'hello') {
+          frame.contentWindow.postMessage({ channel: CHANNEL, v: WIRE, type: 'ready', payload: { surface: 'page', features: {} } }, '*');
+          return;
+        }
+        if (data.type === 'service-request') {
+          answer(data);
+          return;
+        }
+      });
+
+      frame.src = '../panel/index.html';
+    })();
+  </script>
+</body>
+</html>

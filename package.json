@@ -1,0 +1,48 @@
+{
+  "name": "openchamber-cf-matrix-channel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare multi-account matrix: 1:1 proxy binding, encrypted vault, token buckets, breaker states and a JSON-RPC bridge.",
+  "main": "index.js",
+  "type": "commonjs",
+  "bin": {
+    "cf-matrix": "./index.js"
+  },
+  "scripts": {
+    "start": "node service/main.js",
+    "check": "node test/self-check.js",
+    "test:integration": "node test/integration-check.js",
+    "test:fresh": "node test/fresh-install-check.js",
+    "test": "node test/self-check.js && node test/integration-check.js && node test/fresh-install-check.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "displayName": "Cloudflare Matrix Channel",
+    "engines": {
+      "openchamber": ">=2.7.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "cf-matrix-channel",
+        "name": "Cloudflare Matrix",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      },
+      "page": true,
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host"
+      }
+    }
+  },
+  "keywords": [
+    "cloudflare",
+    "multi-account",
+    "proxy",
+    "openchamber-extension"
+  ],
+  "license": "UNLICENSED"
+}

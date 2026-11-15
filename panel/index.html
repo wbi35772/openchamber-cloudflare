@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cloudflare Matrix</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <div class="brand-text">
+          <strong>CF MATRIX</strong>
+          <em>多账号通道</em>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="conn" id="conn"><i></i><span>连接中</span></span>
+        <button class="ghost-btn" data-act="settings" title="运行参数">设置</button>
+        <button class="primary-btn" data-act="add-account" title="添加 Cloudflare 账号">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          添加账号
+        </button>
+      </div>
+    </header>
+
+    <section class="stats" id="stats"></section>
+
+    <section class="toolbar">
+      <div class="filter">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="filter-input" type="search" placeholder="过滤账号 / 标签 / 端口" autocomplete="off" />
+      </div>
+      <div class="toolbar-meta">
+        <button class="ghost-btn small" data-act="refresh" title="刷新">刷新</button>
+        <span id="toolbar-meta"></span>
+      </div>
+    </section>
+
+    <main id="grid" class="grid" aria-live="polite"></main>
+
+    <footer class="footer">
+      <span id="footer-status">等待连接…</span>
+      <span class="footer-hint" id="footer-hint">凭证只存在于本机加密仓，面板不显示明文</span>
+    </footer>
+  </div>
+
+  <div id="toast-root" class="toast-root"></div>
+  <div id="modal-root"></div>
+
+  <script src="./main.js"></script>
+</body>
+</html>

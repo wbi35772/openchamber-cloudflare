@@ -1,0 +1,24 @@
+{
+  "$schema": "./cf-matrix.schema.json",
+  "version": 1,
+  "portStart": 24001,
+  "portEnd": 24250,
+  "risk": {
+    "rps": 4,
+    "burst": 4,
+    "windowLimit": 950,
+    "windowMs": 300000,
+    "jitter": { "minMs": 800, "maxMs": 3200 }
+  },
+  "accounts": [
+    {
+      "id": "cf-a",
+      "label": "cf-a",
+      "authType": "token",
+      "token": "REPLACE_ME_CF_API_TOKEN_PLACEHOLDER",
+      "proxyPort": 24001,
+      "tags": ["edge"],
+      "enabled": true
+    }
+  ]
+}
