@@ -64,6 +64,7 @@ function createRpcHandler(matrix) {
     risk,
     net,
     client,
+    bus,
     config,
     saveConfig,
     configPath,
@@ -86,6 +87,13 @@ function createRpcHandler(matrix) {
     return pick.id;
   }
 
+  function listSlots() {
+    return client.matrixSlots().map((slot) => ({
+      ...slot,
+      egress: slot.matrixSlotId ? net.slotStatus(slot.matrixSlotId) : null,
+    }));
+  }
+
   const methods = {
     'cf.matrix.status'() {
       const snapshot = vault.snapshot();
@@ -105,7 +113,47 @@ function createRpcHandler(matrix) {
         masterKeyPath,
         accounts: snapshot.accounts.length,
         bindings: net.status(),
+        egress: {
+          enabled: Boolean(bus),
+          status: bus && typeof bus.status === 'function' ? bus.status() : null,
+          state: net.egressSnapshot(),
+        },
+        slots: listSlots(),
       };
+    },
+
+    'cf.matrix.slots'() {
+      return listSlots();
+    },
+
+    'cf.egress.status'() {
+      return {
+        enabled: Boolean(bus),
+        status: bus && typeof bus.status === 'function' ? bus.status() : null,
+        state: net.egressSnapshot(),
+        bindings: net.status(),
+      };
+    },
+
+    'cf.slot.list'() {
+      return listSlots();
+    },
+
+    'cf.slot.drain'(params) {
+      const matrixSlotId = requireString(params, 'matrixSlotId');
+      return net.drainSlot(matrixSlotId);
+    },
+
+    async 'cf.slot.rotate'(params) {
+      if (!bus || typeof bus.rotateSlot !== 'function') {
+        throw new RpcError('ERR_EGRESS_BUS_UNAVAILABLE', 'egress bus is not configured');
+      }
+      const matrixSlotId = requireString(params, 'matrixSlotId');
+      const drained = net.drainSlot(matrixSlotId);
+      const rotation = await bus.rotateSlot(matrixSlotId, {
+        reason: params.reason || 'manual',
+      });
+      return { matrixSlotId, drained, rotation };
     },
 
     'cf.config.get'() {
@@ -146,6 +194,7 @@ function createRpcHandler(matrix) {
         cloudflareAccountId: params.cloudflareAccountId,
         tags: params.tags,
         proxyPort,
+        matrixSlotId: params.matrixSlotId,
         egressIpv6: params.egressIpv6,
         enabled: optionalBoolean(params, 'enabled'),
       });
@@ -243,6 +292,30 @@ function createRpcHandler(matrix) {
       return result;
     },
 
+    async 'cf.tunnel.provision'(params) {
+      const matrixSlotId = requireString(params, 'matrixSlotId');
+      return client.provisionTunnelForSlot({
+        matrixSlotId,
+        vmInstanceId: requireString(params, 'vmInstanceId'),
+        localPort: params.localPort === undefined ? undefined : Number(params.localPort),
+        domainZone: requireString(params, 'domainZone'),
+        tunnelName: params.tunnelName,
+        publicHostname: params.publicHostname,
+        cloudflareAccountId: params.cloudflareAccountId,
+        createZone: params.createZone,
+        ingress: params.ingress,
+      });
+    },
+
+    async 'cf.tunnel.teardown'(params) {
+      const tunnelId = requireString(params, 'tunnelId');
+      return client.teardownTunnel({
+        tunnelId,
+        matrixSlotId: params.matrixSlotId,
+        cloudflareAccountId: params.cloudflareAccountId,
+      });
+    },
+
     async 'cf.tunnel.list'(params) {
       const id = pickAccount(params);
       return client.listTunnels(id, { perPage: params.perPage, cloudflareAccountId: params.cloudflareAccountId });
@@ -261,6 +334,7 @@ function createRpcHandler(matrix) {
         compatibilityDate: params.compatibilityDate,
         compatibilityFlags: params.compatibilityFlags,
         metadata: params.metadata,
+        polymorph: params.polymorph,
       });
     },
 
@@ -307,12 +381,21 @@ function createRpcHandler(matrix) {
       };
     },
 
-    'cf.risk.reset'(params) {
+    async 'cf.risk.reset'(params) {
       const id = requireString(params, 'id');
       const profile = vault.get(id);
       if (!profile) throw new RpcError('ERR_NOT_FOUND', `account "${id}" not found`);
+      const previous = vault.state(profile.id) || {};
+      const tunnels = previous.tunnels ? JSON.parse(JSON.stringify(previous.tunnels)) : {};
       risk.reset(profile.id);
-      return vault.resetState(profile.id);
+      vault.resetState(profile.id);
+      if (Object.keys(tunnels).length) {
+        await vault.mutateState(profile.id, (state) => {
+          state.tunnels = tunnels;
+          return state;
+        });
+      }
+      return vault.state(profile.id);
     },
 
     'cf.rpc.methods'() {

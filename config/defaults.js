@@ -12,6 +12,8 @@ const DEFAULTS = Object.freeze({
   apiBase: 'https://api.cloudflare.com/client/v4',
   proxyHost: '127.0.0.1',
   proxyAuth: null,
+  egressBusUrl: 'http://127.0.0.1:19880',
+  routingPlane: 'STRICT_CONTROL',
   portStart: 24001,
   portEnd: 24250,
   probe: {
@@ -84,6 +86,17 @@ function normalizeConfig(raw) {
     config.proxyAuth === null || config.proxyAuth === undefined || config.proxyAuth === ''
       ? null
       : String(config.proxyAuth);
+
+  config.egressBusUrl = String(config.egressBusUrl || DEFAULTS.egressBusUrl)
+    .trim()
+    .replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(config.egressBusUrl)) {
+    throw new Error('egressBusUrl must be an http(s) URL');
+  }
+  config.routingPlane = String(config.routingPlane || DEFAULTS.routingPlane).toUpperCase();
+  if (config.routingPlane !== 'STRICT_CONTROL' && config.routingPlane !== 'ELASTIC_DATA') {
+    throw new Error('routingPlane must be STRICT_CONTROL or ELASTIC_DATA');
+  }
 
   config.portStart = int(config.portStart, 1, 65535, DEFAULTS.portStart);
   config.portEnd = int(config.portEnd, config.portStart, 65535, Math.max(config.portStart, DEFAULTS.portEnd));
@@ -163,6 +176,10 @@ function validateConfig(config) {
   if (config.portEnd < config.portStart) problems.push('portEnd must be >= portStart');
   if (config.risk.windowBucketMs > config.risk.windowMs) problems.push('windowBucketMs must be <= windowMs');
   if (!/^https?:\/\//i.test(String(config.apiBase || ''))) problems.push('apiBase must be http(s)');
+  if (!/^https?:\/\//i.test(String(config.egressBusUrl || ''))) problems.push('egressBusUrl must be http(s)');
+  if (config.routingPlane !== 'STRICT_CONTROL' && config.routingPlane !== 'ELASTIC_DATA') {
+    problems.push('routingPlane must be STRICT_CONTROL or ELASTIC_DATA');
+  }
   return problems;
 }
 

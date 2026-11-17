@@ -143,492 +143,596 @@
     return Math.floor(minutes / 60) + ' 小时 ' + (minutes % 60) + ' 分';
   }
 
-  function toast(text, isError) {
+  function toast(text, tone) {
     var root = document.getElementById('toast-root');
     var node = document.createElement('div');
-    node.className = 'toast' + (isError ? ' err' : '');
+    node.className = 'toast' + (tone ? ' ' + tone : '');
     node.textContent = String(text);
     root.appendChild(node);
     setTimeout(function () {
       node.remove();
-    }, isError ? 6000 : 3200);
+    }, 4200);
   }
 
-  function setConn(label, state) {
-    var node = document.getElementById('conn');
-    node.className = 'conn' + (state ? ' ' + state : '');
-    node.querySelector('span').textContent = label;
+  function setBadge(id, mode, text) {
+    var node = document.getElementById(id);
+    node.className = 'badge' + (mode ? ' ' + mode : '');
+    node.innerHTML = '<i></i>' + esc(text);
   }
 
-  /* ------------------------------------------------------------ state */
+  function setConn(text, tone) {
+    var node = document.getElementById('conn-text');
+    node.textContent = text;
+    node.className = tone === 'ok' ? 'ok' : tone === 'bad' ? 'bad' : '';
+    setBadge('badge-host', tone === 'ok' ? 'on' : tone === 'bad' ? 'off' : '', 'HOST');
+  }
+
+  /* The matrix never renders a raw upstream label: banned channel words are
+     stripped before display, matching the polymorph resource-name rules. */
+  var BANNED_WORDS = ['edgetunnel', 'vless', 'proxy', 'scan'];
+
+  function safeName(text) {
+    var out = String(text || '').toLowerCase();
+    BANNED_WORDS.forEach(function (word) {
+      out = out.split(word).join('-');
+    });
+    out = out
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '');
+    return out || 'slot';
+  }
+
+  function clampPercent(value) {
+    var number = Number(value);
+    if (!Number.isFinite(number)) return 0;
+    return Math.max(0, Math.min(100, number));
+  }
+
+  function effectiveState(slot) {
+    var egress = slot.egress || null;
+    if (egress && egress.healthState === 'WARP_OVERFLOW') return 'WARP_OVERFLOW';
+    if (egress && egress.healthState === 'ROTATING') return 'ROTATING';
+    if (slot.status === 'QUARANTINED' || (egress && egress.healthState === 'QUARANTINED')) {
+      return 'QUARANTINED';
+    }
+    if (slot.status === 'COOLDOWN' && Number(slot.cooldownUntil) > Date.now()) return 'COOLDOWN';
+    if (slot.enabled === false) return 'OFFLINE';
+    return 'ACTIVE';
+  }
+
+  function visualState(slot) {
+    var state = effectiveState(slot);
+    if (state === 'COOLDOWN') return 'cooldown';
+    if (state === 'QUARANTINED') return 'quarantined';
+    if (state === 'WARP_OVERFLOW') return 'warp';
+    if (state === 'ROTATING') return 'rotating';
+    if (state === 'OFFLINE') return 'offline';
+    return 'active';
+  }
+
+  function matchesFilter(slot, filter) {
+    if (filter === 'ALL') return true;
+    var state = effectiveState(slot);
+    if (filter === 'ACTIVE') return state === 'ACTIVE';
+    if (filter === 'COOLDOWN') return state === 'COOLDOWN';
+    if (filter === 'QUARANTINED') {
+      return state === 'QUARANTINED' || state === 'WARP_OVERFLOW' || state === 'ROTATING' || state === 'OFFLINE';
+    }
+    return true;
+  }
+
+  /* ------------------------------------------------------------ state/view */
 
   var state = {
+    slots: [],
     status: null,
-    accounts: [],
-    risk: new Map(),
-    filter: '',
-    needsService: false,
+    filter: 'ALL',
+    lastSync: 0,
   };
 
-  function accountState(profile) {
-    var snapshot = state.risk.get(profile.id);
-    if (snapshot) return snapshot;
-    return profile.state || { status: 'ACTIVE', healthScore: 100, strikes: 0 };
-  }
+  var inflight = null;
 
-  /* ------------------------------------------------------------ render */
-
-  function renderStats() {
-    var accounts = state.accounts;
-    var active = 0;
-    var cooling = 0;
-    var quarantined = 0;
-    accounts.forEach(function (profile) {
-      var st = accountState(profile).status || 'ACTIVE';
-      if (st === 'ACTIVE') active += 1;
-      else if (st === 'COOLDOWN') cooling += 1;
-      else quarantined += 1;
-    });
-    var used = 0;
-    var limit = 0;
-    state.risk.forEach(function (snapshot) {
-      used += snapshot.window ? snapshot.window.used : 0;
-      limit += snapshot.window ? snapshot.window.limit : 0;
-    });
-    var cards = [
-      { label: '账号', value: accounts.length },
-      { label: 'ACTIVE', value: active },
-      { label: 'COOLDOWN / 隔离', value: cooling + ' / ' + quarantined },
-      { label: '窗口请求', value: limit ? used + ' / ' + limit : '—' },
-    ];
-    document.getElementById('stats').innerHTML = cards
-      .map(function (card) {
-        return '<div class="stat"><b>' + esc(card.value) + '</b><span>' + esc(card.label) + '</span></div>';
+  function refresh() {
+    if (inflight) return inflight;
+    inflight = Promise.all([rpc('cf.matrix.slots'), rpc('cf.matrix.status')])
+      .then(function (results) {
+        state.slots = Array.isArray(results[0]) ? results[0] : [];
+        state.status = results[1] || null;
+        state.lastSync = Date.now();
+        render();
+        setConn('已连接', 'ok');
+        return state;
       })
-      .join('');
-  }
-
-  function statusBadge(status) {
-    if (status === 'ACTIVE') return '<span class="badge ok">ACTIVE</span>';
-    if (status === 'COOLDOWN') return '<span class="badge warn">COOLDOWN</span>';
-    return '<span class="badge bad">' + esc(status || 'UNKNOWN') + '</span>';
-  }
-
-  function renderGrid() {
-    var grid = document.getElementById('grid');
-    var needle = state.filter.trim().toLowerCase();
-    var list = state.accounts.filter(function (profile) {
-      if (!needle) return true;
-      var haystack = [profile.id, profile.label, profile.proxyPort]
-        .concat(profile.tags || [])
-        .join(' ')
-        .toLowerCase();
-      return haystack.indexOf(needle) >= 0;
-    });
-
-    if (!state.accounts.length) {
-      grid.innerHTML =
-        '<div class="empty"><strong>还没有 Cloudflare 账号</strong>' +
-        '添加一个 API Token 和代理端口即可开始；端口留空会自动分配。' +
-        '<br><button class="primary-btn" data-act="add-account">添加账号</button></div>';
-      return;
-    }
-    if (!list.length) {
-      grid.innerHTML = '<div class="empty">没有匹配的账号</div>';
-      return;
-    }
-
-    grid.innerHTML = list
-      .map(function (profile) {
-        var snapshot = accountState(profile);
-        var status = snapshot.status || 'ACTIVE';
-        var windowInfo = snapshot.window || { used: 0, limit: 0 };
-        var ratio = windowInfo.limit ? Math.min(1, windowInfo.used / windowInfo.limit) : 0;
-        var barClass = ratio > 0.95 ? 'bad' : ratio > 0.75 ? 'warn' : '';
-        var cooldown =
-          status === 'COOLDOWN' && snapshot.cooldownUntil && snapshot.cooldownUntil > Date.now()
-            ? ' · 冷却 ' + fmtMs(snapshot.cooldownUntil - Date.now())
-            : '';
-        var tags = (profile.tags || [])
-          .map(function (tag) {
-            return '<span class="tag">' + esc(tag) + '</span>';
-          })
-          .join('');
-        return (
-          '<article class="card' + (profile.enabled === false ? ' off' : '') + '" data-id="' + esc(profile.id) + '">' +
-          '<div class="card-head"><div class="card-title"><strong>' + esc(profile.label) + '</strong>' +
-          '<code>' + esc(profile.id) + '</code></div>' + statusBadge(status) + '</div>' +
-          '<div class="meta"><span>代理端口 <b>' + esc(profile.proxyPort) + '</b></span>' +
-          '<span>健康分 <b>' + esc(snapshot.healthScore == null ? 100 : snapshot.healthScore) + '</b></span>' +
-          '<span>窗口 <b>' + esc(windowInfo.used) + ' / ' + esc(windowInfo.limit) + '</b>' + esc(cooldown) + '</span></div>' +
-          '<div class="bar"><i class="' + barClass + '" style="width:' + Math.round(ratio * 100) + '%"></i></div>' +
-          (tags ? '<div class="tags">' + tags + '</div>' : '') +
-          '<div class="card-actions">' +
-          '<button class="ghost-btn" data-acc="verify">验证</button>' +
-          '<button class="ghost-btn" data-acc="probe">探活</button>' +
-          '<button class="ghost-btn" data-acc="toggle">' + (profile.enabled === false ? '启用' : '停用') + '</button>' +
-          '<button class="ghost-btn danger" data-acc="remove">删除</button>' +
-          '</div></article>'
-        );
+      .catch(function (error) {
+        setConn(error.message || '连接失败', 'bad');
+        throw error;
       })
-      .join('');
+      .then(
+        function (value) {
+          inflight = null;
+          return value;
+        },
+        function (error) {
+          inflight = null;
+          throw error;
+        },
+      );
+    return inflight;
   }
 
-  function renderFooter() {
-    var status = state.status;
-    var text = '等待连接…';
-    var hint = '凭证只存在于本机加密仓，面板不显示明文';
-    if (status) {
-      text = '数据目录：' + status.dataDir;
-      hint =
-        '配置：' +
-        (status.configPath || '默认') +
-        ' · 主密钥：' +
-        (status.masterKeySource || 'unknown') +
-        (status.masterKeyPath ? '（' + status.masterKeyPath + '）' : '');
-    }
-    document.getElementById('footer-status').textContent = text;
-    document.getElementById('footer-hint').textContent = hint;
-    document.getElementById('toolbar-meta').textContent =
-      state.accounts.length ? state.accounts.length + ' 个账号' : '';
+  function egressSummary() {
+    var egress = (state.status && state.status.egress) || {};
+    var status = egress.status || {};
+    var slots = egress.state && Array.isArray(egress.state.slots) ? egress.state.slots : [];
+    return {
+      enabled: Boolean(egress.enabled),
+      connected: Boolean(status.connected) || slots.length > 0,
+      slots: slots.length,
+      url: status.baseUrl || status.url || '',
+    };
+  }
+
+  function tunnelCount() {
+    return state.slots.reduce(function (total, slot) {
+      return total + (Array.isArray(slot.tunnels) ? slot.tunnels.length : 0);
+    }, 0);
   }
 
   function render() {
-    renderStats();
-    renderGrid();
-    renderFooter();
+    var egress = egressSummary();
+    setBadge(
+      'badge-egress',
+      egress.enabled ? (egress.connected ? 'on' : 'warn') : 'off',
+      'EGRESS-BUS' + (egress.enabled ? (egress.connected ? '' : ' WAIT') : ' OFF'),
+    );
+    if (egress.url) document.getElementById('badge-egress').title = egress.url;
+
+    var tunnels = tunnelCount();
+    setBadge('badge-instabox', tunnels > 0 ? 'on' : '', 'INSTABOX' + (tunnels ? ' ' + tunnels : ''));
+    document.getElementById('badge-instabox').title = tunnels
+      ? tunnels + ' 条 Instabox 隧道在线'
+      : '尚未签发 Instabox 隧道';
+
+    var grid = document.getElementById('grid');
+    var visible = state.slots.filter(function (slot) {
+      return matchesFilter(slot, state.filter);
+    });
+
+    if (!visible.length) {
+      grid.innerHTML =
+        '<div class="empty"><strong>' +
+        (state.slots.length ? '当前过滤条件下没有槽位' : '还没有槽位账号') +
+        '</strong>' +
+        (state.slots.length
+          ? '切换 ALL 查看全部槽位，或等待冷却结束。'
+          : '点击右上角「+ 新增槽位账号」，账号会按 slot-001…slot-250 顺序绑定 24001–24250 端口。') +
+        '</div>';
+    } else {
+      grid.innerHTML = visible.map(cardHtml).join('');
+    }
+
+    document.getElementById('last-sync').textContent = state.lastSync
+      ? '最后同步 ' + new Date(state.lastSync).toLocaleTimeString()
+      : '';
   }
 
-  /* ------------------------------------------------------------ data */
+  function cardHtml(slot) {
+    var visual = visualState(slot);
+    var slotId = slot.matrixSlotId || 'slot-???';
+    var port = slot.egressPort || slot.proxyPort || '—';
+    var fingerprint = (slot.egress && slot.egress.egressFingerprint) || {};
+    var used = slot.window && Number.isFinite(Number(slot.window.used)) ? Number(slot.window.used) : 0;
+    var limit = slot.window && Number.isFinite(Number(slot.window.limit)) ? Number(slot.window.limit) : 950;
+    var health = Number(slot.healthScore);
+    if (!Number.isFinite(health)) health = 100;
+    var cooldown = Number(slot.cooldownUntil) > Date.now() ? fmtMs(Number(slot.cooldownUntil) - Date.now()) : '—';
+    var tunnels = Array.isArray(slot.tunnels) ? slot.tunnels : [];
+    var hostnames = tunnels.length
+      ? tunnels
+          .slice(0, 3)
+          .map(function (tunnel) {
+            return '<div class="hostname" title="' + esc(tunnel.publicHostname) + '"><i></i>' + esc(tunnel.publicHostname) + '</div>';
+          })
+          .join('') +
+        (tunnels.length > 3
+          ? '<div class="hostname empty-host"><i></i>+' + (tunnels.length - 3) + ' more</div>'
+          : '')
+      : '<div class="hostname empty-host"><i></i>未签发 Instabox 隧道</div>';
+    var disabled = slot.matrixSlotId ? '' : ' disabled';
+    var stateLabel = effectiveState(slot);
 
-  function refresh() {
-    return Promise.all([rpc('cf.matrix.status'), rpc('cf.account.list'), rpc('cf.risk.report', {})])
-      .then(function (results) {
-        state.status = results[0];
-        state.accounts = (results[1] && results[1].accounts) || [];
-        var riskAccounts = (results[2] && results[2].accounts) || [];
-        state.risk = new Map(
-          riskAccounts.map(function (snapshot) {
-            return [snapshot.accountId, snapshot];
-          }),
-        );
-        state.needsService = false;
-        setConn('已连接', 'on');
-        render();
-      })
-      .catch(function (error) {
-        if (
-          error.code === 'NO_SERVICE' ||
-          error.code === 'NOT_GRANTED' ||
-          error.code === 'DISABLED' ||
-          error.code === 'SERVICE_FAILED'
-        ) {
-          state.needsService = true;
-          setConn('服务未授权', 'off');
-          document.getElementById('footer-status').textContent =
-            CODE_HINTS[error.code] || '本地服务不可用';
-        } else {
-          setConn('连接失败', 'off');
-          document.getElementById('footer-status').textContent = error.message;
-        }
-        throw error;
-      });
+    return (
+      '<article class="card state-' + visual + '">' +
+      '<header class="card-head">' +
+      '<div class="slot-id"><span class="pulse"></span><b>' + esc(slotId) + '</b><span class="port">:' + esc(port) + '</span></div>' +
+      '<span class="status-pill">' + esc(stateLabel) + '</span>' +
+      '</header>' +
+      '<div class="card-name" title="' + esc(slot.label) + '">' + esc(safeName(slot.label)) +
+      '<small>' + esc((slot.authType || 'token').toUpperCase()) + ' · ' + esc(slot.accountId) + '</small></div>' +
+      '<dl class="meta">' +
+      '<div><dt>CF-RAY</dt><dd title="' + esc(slot.lastRay || '') + '">' + esc(slot.lastRay || '—') + '</dd></div>' +
+      '<div><dt>EXIT IP</dt><dd title="' + esc(fingerprint.exitIp || '') + '">' + esc(fingerprint.exitIp || '—') + '</dd></div>' +
+      '<div><dt>PREFIX /64</dt><dd title="' + esc(fingerprint.ipv6Prefix64 || '') + '">' + esc(fingerprint.ipv6Prefix64 || '—') + '</dd></div>' +
+      '</dl>' +
+      '<div class="hostnames">' + hostnames + '</div>' +
+      '<div class="meters">' +
+      '<div class="meter">' +
+      '<div class="meter-label"><span>5m API QUOTA</span><b>' + used + ' / ' + limit + '</b></div>' +
+      '<div class="meter-track"><i style="width:' + clampPercent(limit ? (used / limit) * 100 : 0) + '%"></i></div>' +
+      '</div>' +
+      '<div class="meter health">' +
+      '<div class="meter-label"><span>HEALTH · COOLDOWN ' + esc(cooldown) + '</span><b>' + Math.round(health) + '%</b></div>' +
+      '<div class="meter-track"><i style="width:' + clampPercent(health) + '%"></i></div>' +
+      '</div>' +
+      '</div>' +
+      '<footer class="card-actions">' +
+      '<button class="btn" type="button" data-act="tunnel" data-slot="' + esc(slot.matrixSlotId || '') + '"' + disabled + '>签发 Instabox 隧道</button>' +
+      '<button class="btn" type="button" data-act="dns" data-slot="' + esc(slot.matrixSlotId || '') + '"' + disabled + '>同步 DNS</button>' +
+      '<button class="btn" type="button" data-act="drain" data-slot="' + esc(slot.matrixSlotId || '') + '"' + disabled + '>排空连接池</button>' +
+      '<button class="btn btn-danger" type="button" data-act="rotate" data-slot="' + esc(slot.matrixSlotId || '') + '"' + disabled + '>强制换血(联动 Egress)</button>' +
+      '</footer>' +
+      '</article>'
+    );
   }
 
-  /* ------------------------------------------------------------ modals */
+  function slotById(slotId) {
+    for (var index = 0; index < state.slots.length; index += 1) {
+      if (state.slots[index].matrixSlotId === slotId) return state.slots[index];
+    }
+    return null;
+  }
+
+  /* ---------------------------------------------------------------- modals */
 
   function closeModal() {
     document.getElementById('modal-root').innerHTML = '';
   }
 
-  function openModal(title, bodyHtml, footerHtml) {
+  function fieldHtml(field) {
+    var id = 'f-' + field.name;
+    var label = '<label for="' + esc(id) + '">' + esc(field.label) + '</label>';
+    var control;
+    if (field.type === 'select') {
+      control =
+        '<select id="' + esc(id) + '" name="' + esc(field.name) + '">' +
+        (field.options || [])
+          .map(function (option) {
+            return (
+              '<option value="' + esc(option.value) + '"' +
+              (String(field.value) === String(option.value) ? ' selected' : '') +
+              '>' + esc(option.label) + '</option>'
+            );
+          })
+          .join('') +
+        '</select>';
+    } else if (field.type === 'textarea') {
+      control =
+        '<textarea id="' + esc(id) + '" name="' + esc(field.name) + '" placeholder="' +
+        esc(field.placeholder || '') + '">' + esc(field.value || '') + '</textarea>';
+    } else {
+      control =
+        '<input id="' + esc(id) + '" name="' + esc(field.name) + '" type="' +
+        esc(field.type || 'text') + '" value="' + esc(field.value || '') +
+        '" placeholder="' + esc(field.placeholder || '') + '" autocomplete="off" />';
+    }
+    return '<div class="field">' + label + control + '</div>';
+  }
+
+  function openModal(options) {
     var root = document.getElementById('modal-root');
     root.innerHTML =
-      '<div class="modal-backdrop" data-close="1"><section class="modal" role="dialog" aria-modal="true">' +
-      '<header><strong>' + esc(title) + '</strong><button data-close="1" aria-label="关闭">×</button></header>' +
-      '<div class="body">' + bodyHtml + '</div>' +
-      '<footer>' + footerHtml + '</footer></section></div>';
-    root.querySelectorAll('[data-close]').forEach(function (node) {
-      node.addEventListener('click', function (event) {
-        if (event.target === node) closeModal();
+      '<div class="modal-backdrop" data-modal-close>' +
+      '<div class="modal" role="dialog" aria-modal="true">' +
+      '<h2>' + esc(options.title) + '</h2>' +
+      '<p class="modal-sub">' + esc(options.subtitle || '') + '</p>' +
+      '<form novalidate>' +
+      (options.fields || []).map(fieldHtml).join('') +
+      '<div class="modal-error"></div>' +
+      '<div class="modal-actions">' +
+      '<button type="button" class="btn btn-ghost" data-modal-close>取消</button>' +
+      '<button type="submit" class="btn ' + (options.danger ? 'btn-danger' : 'btn-primary') + '">' +
+      esc(options.submitLabel || '提交') + '</button>' +
+      '</div>' +
+      '</form>' +
+      '</div>' +
+      '</div>';
+
+    var form = root.querySelector('form');
+    var errorBox = form.querySelector('.modal-error');
+    var submit = form.querySelector('button[type="submit"]');
+    var first = form.querySelector('input, select, textarea');
+    if (first) first.focus();
+
+    root.querySelector('.modal-backdrop').addEventListener('click', function (event) {
+      if (event.target === event.currentTarget) closeModal();
+    });
+    root.querySelectorAll('[data-modal-close]').forEach(function (node) {
+      node.addEventListener('click', function () {
+        closeModal();
       });
     });
-    var first = root.querySelector('input, select, textarea');
-    if (first) setTimeout(function () { first.focus(); }, 30);
-  }
+    document.addEventListener('keydown', function onEscape(event) {
+      if (event.key !== 'Escape') return;
+      document.removeEventListener('keydown', onEscape);
+      closeModal();
+    });
 
-  function field(label, inner, hint) {
-    return (
-      '<label class="field"><span>' + esc(label) + '</span>' + inner +
-      (hint ? '<span class="hint">' + esc(hint) + '</span>' : '') +
-      '</label>'
-    );
-  }
-
-  function confirmAction(title, message, confirmLabel, onConfirm) {
-    openModal(
-      title,
-      '<p class="confirm-text">' + esc(message) + '</p>',
-      '<button class="ghost-btn" data-close="1">取消</button>' +
-        '<button class="ghost-btn danger" data-act="confirm-ok">' + esc(confirmLabel) + '</button>',
-    );
-    var root = document.getElementById('modal-root');
-    var button = root.querySelector('[data-act="confirm-ok"]');
-    button.addEventListener('click', function () {
-      button.disabled = true;
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      var values = {};
+      form.querySelectorAll('[name]').forEach(function (input) {
+        values[input.name] = input.value.trim();
+      });
+      submit.disabled = true;
+      errorBox.style.display = 'none';
       Promise.resolve()
-        .then(onConfirm)
-        .then(function () { closeModal(); })
-        .catch(function (error) {
-          button.disabled = false;
-          toast(error.message, true);
-        });
-    });
-  }
-
-  function openAddAccount() {
-    var body =
-      '<div class="grid-2">' +
-      field('名称', '<input name="label" placeholder="例如 Acme 主账号" required>') +
-      field('认证方式', '<select name="authType"><option value="token">API Token</option><option value="key">Global API Key</option></select>') +
-      '</div>' +
-      '<div data-auth="token">' +
-      field('API Token', '<textarea name="token" placeholder="粘贴 Cloudflare API Token"></textarea>', '建议使用最小权限 Token；只保存在本机加密仓') +
-      '</div>' +
-      '<div data-auth="key" hidden>' +
-      '<div class="grid-2">' +
-      field('邮箱', '<input name="email" placeholder="you@example.com">') +
-      field('Global API Key', '<input name="apiKey" type="password" placeholder="Global API Key">') +
-      '</div></div>' +
-      '<div class="grid-2">' +
-      field('代理端口', '<input name="proxyPort" type="number" min="1" max="65535" placeholder="留空自动分配">') +
-      field('标签', '<input name="tags" placeholder="prod,eu">') +
-      '</div>' +
-      field('Cloudflare Account ID', '<input name="cloudflareAccountId" placeholder="可选；多账号用户必填">');
-    openModal(
-      '添加 Cloudflare 账号',
-      body,
-      '<button class="ghost-btn" data-close="1">取消</button>' +
-        '<button class="primary-btn" data-act="submit-add">添加</button>',
-    );
-
-    var root = document.getElementById('modal-root');
-    var select = root.querySelector('select[name="authType"]');
-    select.addEventListener('change', function () {
-      var isKey = select.value === 'key';
-      root.querySelector('[data-auth="token"]').hidden = isKey;
-      root.querySelector('[data-auth="key"]').hidden = !isKey;
-    });
-    root.querySelector('[data-act="submit-add"]').addEventListener('click', function () {
-      var button = this;
-      var get = function (name) {
-        var node = root.querySelector('[name="' + name + '"]');
-        return node ? node.value.trim() : '';
-      };
-      var authType = get('authType');
-      var params = {
-        label: get('label'),
-        authType: authType,
-        tags: get('tags') ? get('tags').split(',').map(function (tag) { return tag.trim(); }).filter(Boolean) : undefined,
-        cloudflareAccountId: get('cloudflareAccountId') || undefined,
-        enabled: true,
-      };
-      if (!params.label) return toast('请填写名称', true);
-      if (authType === 'token') {
-        if (!get('token')) return toast('请填写 API Token', true);
-        params.token = get('token');
-      } else {
-        if (!get('email') || !get('apiKey')) return toast('Global API Key 需要邮箱和 Key', true);
-        params.email = get('email');
-        params.apiKey = get('apiKey');
-      }
-      if (get('proxyPort')) params.proxyPort = Number(get('proxyPort'));
-      button.disabled = true;
-      rpc('cf.account.add', params)
-        .then(function (profile) {
+        .then(function () {
+          return options.onSubmit ? options.onSubmit(values) : undefined;
+        })
+        .then(function (message) {
           closeModal();
-          toast('已添加 ' + profile.label + '（端口 ' + profile.proxyPort + '）');
-          return refresh();
+          if (message) toast(message);
+          refresh().catch(function () {});
         })
         .catch(function (error) {
-          button.disabled = false;
-          toast(error.message, true);
+          errorBox.textContent = error.message || String(error);
+          errorBox.style.display = 'block';
+          submit.disabled = false;
         });
     });
   }
 
-  function openSettings() {
-    rpc('cf.config.get')
-      .then(function (data) {
-        var config = data.config || {};
-        var risk = config.risk || {};
-        var jitter = risk.jitter || {};
-        function num(name, value, extra) {
-          return field(name, '<input type="number" name="' + name + '" value="' + esc(value) + '"' + (extra || '') + '>');
+  function confirmModal(title, subtitle, submitLabel, onConfirm) {
+    openModal({
+      title: title,
+      subtitle: subtitle,
+      submitLabel: submitLabel,
+      danger: true,
+      fields: [],
+      onSubmit: onConfirm,
+    });
+  }
+
+  /* --------------------------------------------------------------- actions */
+
+  function openAddAccount() {
+    openModal({
+      title: '+ 新增槽位账号',
+      subtitle: '账号会按 slot-001…slot-250 顺序占用 24001–24250 的 egress 端口；凭证写入本机 AES-256-GCM 仓。',
+      submitLabel: '创建并绑定',
+      fields: [
+        { name: 'label', label: '标签', placeholder: 'main-account' },
+        {
+          name: 'authType',
+          label: '鉴权方式',
+          type: 'select',
+          value: 'token',
+          options: [
+            { value: 'token', label: 'API Token' },
+            { value: 'key', label: 'Global Key + Email' },
+          ],
+        },
+        { name: 'token', label: 'API Token', placeholder: 'cf token' },
+        { name: 'email', label: 'Email（Global Key）', placeholder: 'ops@example.com' },
+        { name: 'apiKey', label: 'Global API Key', placeholder: '仅 Global Key 模式' },
+        { name: 'matrixSlotId', label: '指定槽位（留空自动分配）', placeholder: 'slot-001' },
+        { name: 'tags', label: '标签（逗号分隔）', placeholder: 'prod,instabox' },
+      ],
+      onSubmit: function (values) {
+        var params = {
+          label: values.label,
+          authType: values.authType,
+          tags: values.tags
+            ? values.tags.split(',').map(function (tag) {
+                return tag.trim();
+              }).filter(Boolean)
+            : undefined,
+        };
+        if (values.matrixSlotId) params.matrixSlotId = values.matrixSlotId;
+        if (values.authType === 'key') {
+          params.email = values.email;
+          params.apiKey = values.apiKey;
+        } else {
+          params.token = values.token;
         }
-        var body =
-          '<div class="grid-2">' +
-          field('API 基址', '<input name="apiBase" value="' + esc(config.apiBase || '') + '">') +
-          field('代理主机', '<input name="proxyHost" value="' + esc(config.proxyHost || '') + '">', 'sing-box / mihomo 所在主机') +
-          '</div>' +
-          '<div class="grid-2">' +
-          num('portStart', config.portStart) +
-          num('portEnd', config.portEnd) +
-          '</div>' +
-          '<div class="grid-2">' +
-          num('risk.rps', risk.rps, ' step="0.1" min="0.1"') +
-          num('risk.burst', risk.burst, ' min="1"') +
-          '</div>' +
-          '<div class="grid-2">' +
-          num('risk.windowLimit', risk.windowLimit, ' min="1"') +
-          num('risk.windowMs', risk.windowMs, ' min="1000"') +
-          '</div>' +
-          '<div class="grid-2">' +
-          num('risk.jitter.minMs', jitter.minMs, ' min="0"') +
-          num('risk.jitter.maxMs', jitter.maxMs, ' min="0"') +
-          '</div>' +
-          field('代理认证', '<input name="proxyAuth" placeholder="user:pass，可留空" value="' + esc(config.proxyAuth || '') + '">') +
-          '<div class="hint">配置保存到 ' + esc(data.configPath || '数据目录') + '，立即生效。主密钥来源：' + esc(data.masterKeySource || 'unknown') + '。</div>';
-        openModal(
-          '运行参数',
-          body,
-          '<button class="ghost-btn" data-close="1">取消</button>' +
-            '<button class="primary-btn" data-act="submit-settings">保存</button>',
-        );
-        var root = document.getElementById('modal-root');
-        root.querySelector('[data-act="submit-settings"]').addEventListener('click', function () {
-          var button = this;
-          var pick = function (name) {
-            var node = root.querySelector('[name="' + name + '"]');
-            return node ? node.value.trim() : '';
-          };
-          var patch = {
-            apiBase: pick('apiBase'),
-            proxyHost: pick('proxyHost'),
-            proxyAuth: pick('proxyAuth') || null,
-            portStart: Number(pick('portStart')),
-            portEnd: Number(pick('portEnd')),
-            risk: {
-              rps: Number(pick('risk.rps')),
-              burst: Number(pick('risk.burst')),
-              windowLimit: Number(pick('risk.windowLimit')),
-              windowMs: Number(pick('risk.windowMs')),
-              jitter: {
-                minMs: Number(pick('risk.jitter.minMs')),
-                maxMs: Number(pick('risk.jitter.maxMs')),
-              },
-            },
-          };
-          button.disabled = true;
-          rpc('cf.config.patch', patch)
-            .then(function () {
-              closeModal();
-              toast('参数已保存并生效');
-              return refresh();
-            })
-            .catch(function (error) {
-              button.disabled = false;
-              toast(error.message, true);
-            });
+        return rpc('cf.account.add', params).then(function (result) {
+          return '已新增 ' + (result.matrixSlotId || result.egressPort || result.id);
         });
+      },
+    });
+  }
+
+  function openDeployWorker() {
+    var options = state.slots
+      .filter(function (slot) {
+        return Boolean(slot.matrixSlotId);
+      })
+      .map(function (slot) {
+        return {
+          value: slot.matrixSlotId,
+          label: slot.matrixSlotId + ' :' + (slot.egressPort || slot.proxyPort) + ' · ' + safeName(slot.label),
+        };
+      });
+    if (!options.length) {
+      toast('先新增一个槽位账号，再部署 Worker', 'err');
+      return;
+    }
+    openModal({
+      title: '多态部署 Worker',
+      subtitle: '同一份逻辑按 Cloudflare 账号 id 生成不同 SHA-256 的模块；脚本名会先去敏。',
+      submitLabel: '部署',
+      fields: [
+        { name: 'matrixSlotId', label: '槽位', type: 'select', value: options[0].value, options: options },
+        { name: 'scriptName', label: '脚本名', value: 'instabox-edge', placeholder: 'instabox-edge' },
+        {
+          name: 'code',
+          label: '模块源码',
+          type: 'textarea',
+          value:
+            'export default {\n' +
+            '  async fetch(request) {\n' +
+            '    return new Response("matrix-ok", { status: 200 });\n' +
+            '  },\n' +
+            '};\n',
+        },
+      ],
+      onSubmit: function (values) {
+        var slot = slotById(values.matrixSlotId);
+        if (!slot) throw new Error('槽位不存在：' + values.matrixSlotId);
+        return rpc('cf.worker.deploy', {
+          id: slot.accountId,
+          scriptName: values.scriptName,
+          code: values.code,
+          polymorph: true,
+        }).then(function (result) {
+          return '已部署 ' + result.script + ' · ' + String(result.digest || '').slice(0, 12) + '…';
+        });
+      },
+    });
+  }
+
+  function openTunnel(slot) {
+    openModal({
+      title: '签发 Instabox 隧道',
+      subtitle: slot.matrixSlotId + ' :' + (slot.egressPort || slot.proxyPort) + ' · 生成 Zero Trust 隧道 + 代理 CNAME',
+      submitLabel: '签发',
+      fields: [
+        { name: 'vmInstanceId', label: 'VM 实例 ID', placeholder: 'vm-instance-01' },
+        { name: 'localPort', label: 'VM 本地端口', value: '8080', type: 'number' },
+        { name: 'domainZone', label: '域名 Zone', placeholder: 'example.com' },
+        { name: 'publicHostname', label: '公开主机名（留空自动）', placeholder: 'vm1.example.com' },
+        { name: 'tunnelName', label: '隧道名（留空自动去敏）', placeholder: 'instabox-vm1' },
+      ],
+      onSubmit: function (values) {
+        var params = {
+          matrixSlotId: slot.matrixSlotId,
+          vmInstanceId: values.vmInstanceId,
+          localPort: Number(values.localPort || 8080),
+          domainZone: values.domainZone,
+        };
+        if (values.publicHostname) params.publicHostname = values.publicHostname;
+        if (values.tunnelName) params.tunnelName = values.tunnelName;
+        return rpc('cf.tunnel.provision', params).then(function (result) {
+          return '隧道 ' + result.tunnelId + ' → ' + result.publicHostname;
+        });
+      },
+    });
+  }
+
+  function actDns(slot) {
+    var tunnel = (slot.tunnels || [])[0];
+    if (!tunnel) {
+      toast('该槽位还没有 Instabox 隧道，先签发一条', 'warn');
+      return;
+    }
+    rpc('cf.tunnel.provision', {
+      matrixSlotId: slot.matrixSlotId,
+      vmInstanceId: tunnel.vmInstanceId,
+      localPort: tunnel.localPort,
+      domainZone: tunnel.domainZone || (tunnel.publicHostname || '').split('.').slice(1).join('.'),
+      publicHostname: tunnel.publicHostname,
+      tunnelName: tunnel.tunnelName,
+    })
+      .then(function () {
+        toast('DNS 已同步 · ' + tunnel.publicHostname);
+        return refresh();
       })
       .catch(function (error) {
-        toast(error.message, true);
+        toast(error.message, 'err');
       });
   }
 
-  /* ------------------------------------------------------------ actions */
-
-  function withCard(button, handler) {
-    var card = button.closest('.card');
-    var id = card && card.getAttribute('data-id');
-    if (!id) return;
-    button.disabled = true;
-    Promise.resolve(handler(id))
+  function actDrain(slot) {
+    rpc('cf.slot.drain', { matrixSlotId: slot.matrixSlotId })
+      .then(function (result) {
+        toast('已排空 ' + result.matrixSlotId + ' · ' + result.drained + ' 条连接池');
+        return refresh();
+      })
       .catch(function (error) {
-        toast(error.message, true);
+        toast(error.message, 'err');
+      });
+  }
+
+  function actRotate(slot) {
+    confirmModal(
+      '强制换血 ' + slot.matrixSlotId,
+      '会在 Egress Matrix 上请求轮换该槽位的租约，立即排空连接池，并在 POST_ROTATION_RESUME 前保持 fail-closed。',
+      '确认换血',
+      function () {
+        return rpc('cf.slot.rotate', {
+          matrixSlotId: slot.matrixSlotId,
+          reason: 'panel-manual',
+        }).then(function (result) {
+          return '换血已提交 · 排空 ' + (result.drained && result.drained.drained) + ' 条连接';
+        });
+      },
+    );
+  }
+
+  function verifyAll() {
+    var button = document.getElementById('btn-verify');
+    if (button.disabled) return;
+    button.disabled = true;
+    var slots = state.slots.slice();
+    var ok = 0;
+    var failed = 0;
+    var chain = Promise.resolve();
+    slots.forEach(function (slot) {
+      chain = chain.then(function () {
+        return rpc('cf.account.verify', { id: slot.accountId })
+          .then(function (result) {
+            if (result && result.ok) ok += 1;
+            else failed += 1;
+          })
+          .catch(function () {
+            failed += 1;
+          });
+      });
+    });
+    chain
+      .then(function () {
+        toast('验活完成 · 通过 ' + ok + ' / 失败 ' + failed, failed ? 'warn' : undefined);
+        return refresh();
+      })
+      .catch(function (error) {
+        toast(error.message, 'err');
       })
       .then(function () {
         button.disabled = false;
       });
   }
 
-  function act(button) {
-    var action = button.getAttribute('data-acc');
-    if (action === 'verify') {
-      return withCard(button, function (id) {
-        return rpc('cf.account.verify', { id }).then(function (result) {
-          toast(result.ok ? 'Token 有效（' + (result.status || 'active') + '）' : '验证失败：' + (result.error || 'unknown'), !result.ok);
-          return refresh();
-        });
-      });
-    }
-    if (action === 'probe') {
-      return withCard(button, function (id) {
-        return rpc('cf.proxy.probe', { id }).then(function (trace) {
-          var ip = trace && (trace.ip || trace.clientIp || trace.origin);
-          toast(ip ? '出口 IP：' + ip : '探活成功');
-        });
-      });
-    }
-    if (action === 'toggle') {
-      return withCard(button, function (id) {
-        var profile = state.accounts.find(function (item) { return item.id === id; });
-        var enabled = !profile || profile.enabled === false;
-        return rpc('cf.account.update', { id: id, patch: { enabled: enabled } }).then(function () {
-          toast(enabled ? '已启用' : '已停用');
-          return refresh();
-        });
-      });
-    }
-    if (action === 'remove') {
-      var card = button.closest('.card');
-      var id = card && card.getAttribute('data-id');
-      var profile = state.accounts.find(function (item) { return item.id === id; });
-      if (!id) return;
-      confirmAction(
-        '删除账号',
-        '删除 ' + (profile ? profile.label : id) + '？密封凭证会一并移除。',
-        '删除',
-        function () {
-          return rpc('cf.account.remove', { id: id }).then(function () {
-            toast('已删除');
-            return refresh();
-          });
-        },
-      );
-    }
-  }
+  /* ---------------------------------------------------------------- wiring */
 
-  /* ------------------------------------------------------------ wiring */
-
-  document.addEventListener('click', function (event) {
-    var node = event.target.closest('[data-act]');
-    if (!node) return;
-    var action = node.getAttribute('data-act');
-    if (action === 'add-account') openAddAccount();
-    else if (action === 'settings') openSettings();
-    else if (action === 'refresh') {
-      node.disabled = true;
-      refresh()
-        .catch(function (error) {
-          toast(error.message, true);
-        })
-        .then(function () {
-          node.disabled = false;
-        });
-    }
+  document.getElementById('filters').addEventListener('click', function (event) {
+    var button = event.target.closest('.filter');
+    if (!button) return;
+    state.filter = button.getAttribute('data-filter') || 'ALL';
+    document.querySelectorAll('.filter').forEach(function (node) {
+      node.classList.toggle('active', node === button);
+    });
+    render();
   });
 
-  document.addEventListener('click', function (event) {
-    var node = event.target.closest('[data-acc]');
-    if (node) act(node);
+  document.getElementById('grid').addEventListener('click', function (event) {
+    var button = event.target.closest('button[data-act]');
+    if (!button) return;
+    var slot = slotById(button.getAttribute('data-slot'));
+    if (!slot) {
+      toast('槽位已失效，刷新后重试', 'err');
+      return;
+    }
+    var action = button.getAttribute('data-act');
+    if (action === 'tunnel') openTunnel(slot);
+    else if (action === 'dns') actDns(slot);
+    else if (action === 'drain') actDrain(slot);
+    else if (action === 'rotate') actRotate(slot);
   });
 
-  document.getElementById('filter-input').addEventListener('input', function () {
-    state.filter = this.value;
-    renderGrid();
-  });
+  document.getElementById('btn-add').addEventListener('click', openAddAccount);
+  document.getElementById('btn-deploy').addEventListener('click', openDeployWorker);
+  document.getElementById('btn-verify').addEventListener('click', verifyAll);
 
   function boot() {
     readyHandlers.add(function () {
@@ -642,9 +746,9 @@
       }, 1600);
       setInterval(function () {
         refresh().catch(function () {});
-      }, 30000);
+      }, 15000);
     } else {
-      setConn('未嵌入', 'off');
+      setConn('未嵌入', 'bad');
       document.getElementById('grid').innerHTML =
         '<div class="empty"><strong>请从 OpenChamber 扩展面板打开</strong>' +
         '这个页面通过 openchamber.sdk 与本地服务通信，直接打开浏览器无法访问数据。</div>';

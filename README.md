@@ -1,15 +1,23 @@
 # cf-matrix-channel
 
-多 Cloudflare 账号矩阵扩展：**1:1 本地代理端口绑定、加密凭证仓、持久化滑动窗口预算、三级熔断状态机、JSON-RPC 桥**。
+多 Cloudflare 账号矩阵扩展：**T0 三扩展协同（Egress Matrix → CF Matrix → Instabox）、1:1 本地代理端口绑定、加密凭证仓、持久化滑动窗口预算、三级熔断状态机、JSON-RPC 桥**。
 
 该目录是一个独立 OpenChamber 扩展仓库，复用了 `openchamber-instabox-matrix` 的四个底座模块：
 
 | 底座 | 本扩展中的用途 |
 | --- | --- |
-| `lib/proxy-fetch.js` | 每个账号独立的代理传输实例，CONNECT 隧道，fail-closed |
+| `lib/proxy-fetch.js` | 每个账号独立的代理传输实例，CONNECT 隧道、槽位认证头、`drain()`，fail-closed |
 | `lib/store-lock.js` | `withStateLock` 跨进程互斥 + tmp/rename 原子写 |
 | `lib/scheduler.js` | 账号相位散列（FNV-1a） |
 | `lib/sub2port.js` | 端口池约定（24001–24250）随仓库复制，供后续 sing-box 编排复用 |
+
+T0 协同关系：
+
+| 层 | 扩展 | 本扩展的边界 |
+| --- | --- | --- |
+| 网络层 | `openchamber-egress-matrix` | 只经 `slot-001…slot-250` 的 `24001–24250` 端口出网；槽位不安全时 fail-closed |
+| 业务层 | 本扩展 | Cloudflare v4（Zone/DNS/Tunnel/Worker）、凭证、预算、风控 |
+| 交付层 | `openchamber-instabox` | `cf.tunnel.provision` 签发 Zero Trust Tunnel + 代理 CNAME |
 
 ## 目录
 
@@ -24,10 +32,13 @@ openchamber-cf-matrix-channel/
 │   ├── cf-matrix.schema.json # 配置 JSON Schema
 │   └── cf-matrix.config.example.json # 种子账号与风控参数示例
 ├── core/
+│   ├── contract.js          # Egress Matrix 契约：槽位/端口/指纹/STRICT_CONTROL 头
+│   ├── polymorph.js         # 确定性 Worker 多态 + 去敏资源名
+│   ├── egress-bus.js        # 19880 总线客户端（WS 冻结/恢复 + HTTP 换血）
 │   ├── vault-store.js        # AES-256-GCM 加密账号仓 + 原子状态文件
 │   ├── risk-engine.js        # 令牌桶、泊松抖动、滑动窗口、熔断器
-│   ├── net-binder.js         # 1:1 端口绑定、TCP 探活、连接槽位
-│   └── cf-client.js          # Cloudflare v4 API（DNS / Tunnel / Worker）
+│   ├── net-binder.js         # 槽位绑定、实时安全检查、连接槽位、排空
+│   └── cf-client.js          # Cloudflare v4 API（DNS / Tunnel / Worker / 多态）
 ├── bridge/
 │   └── rpc-handler.js        # JSON-RPC 方法表
 ├── panel/
@@ -121,20 +132,37 @@ node index.js rpc cf.dns.sync '{"domain":"example.com","records":[{"type":"A","n
 
 | 方法 | 说明 |
 | --- | --- |
-| `cf.matrix.status` | 配置、端口池、账号数、绑定连接状态、主密钥来源 |
+| `cf.matrix.status` | 配置、端口池、账号数、绑定连接状态、Egress 快照、主密钥来源 |
+| `cf.matrix.slots` | 槽位视图：slot/port、状态、5 分钟预算窗口、出口指纹、Instabox 隧道 |
+| `cf.egress.status` | Egress 总线连接状态 + 最近一次快照 + 全部绑定 |
 | `cf.config.get` | 当前配置全文 + 配置文件路径 + 主密钥来源 |
-| `cf.config.patch` | 运行时热更新配置（`apiBase`/`portStart`/`portEnd`/`probe`/`risk`/`http`），立即落盘 |
-| `cf.account.add` | 新增账号；省略 `proxyPort` 时自动取空闲端口，token 落盘即加密 |
-| `cf.account.update` / `remove` / `list` / `status` | 账号 CRUD 与状态 |
+| `cf.config.patch` | 运行时热更新配置（`apiBase`/`egressBusUrl`/`routingPlane`/`portStart`/`portEnd`/`probe`/`risk`/`http`），立即落盘 |
+| `cf.account.add` | 新增账号；按 `slot-001…slot-250` 顺序占用 24001–24250，token 落盘即加密 |
+| `cf.account.update` / `remove` / `list` / `status` | 账号 CRUD 与状态；端口/槽位 1:1，重复即 `ERR_SLOT_TAKEN` |
 | `cf.account.verify` | `/user/tokens/verify`（token）或 `/user`（global key） |
 | `cf.proxy.probe` | 经绑定代理访问 `cdn-cgi/trace`，返回出口 IP / 地区 |
+| `cf.slot.drain` | 立即排空某槽位的连接池（不改变槽位状态） |
+| `cf.slot.rotate` | 排空 + 请求 Egress Matrix 强制换血，等 `POST_ROTATION_RESUME` 后恢复 |
 | `cf.dns.sync` | 幂等对齐 A/AAAA/CNAME/TXT/MX/NS/SRV/CAA/PTR |
 | `cf.dns.list` / `cf.dns.delete` | Zone 内 DNS 记录操作 |
 | `cf.tunnel.spawn` | 创建/复用 Argo Tunnel、写入 ingress、取回 tunnel token |
+| `cf.tunnel.provision` | Instabox 契约：`{matrixSlotId,vmInstanceId,localPort,domainZone}` → 隧道 + 代理 CNAME + `cfRay` |
+| `cf.tunnel.teardown` | 删除隧道与对应 CNAME，并清理 vault 内的隧道记录 |
 | `cf.tunnel.list` | 列出账号下 Tunnel |
-| `cf.worker.deploy` | multipart 上传 ES module Worker |
+| `cf.worker.deploy` | multipart 上传 ES module Worker；默认按云账号做多态包装 |
 | `cf.request` | 原始 v4 API 调用；无 `id` 时按健康分/预算自动选号 |
-| `cf.risk.report` / `cf.risk.reset` | 熔断快照 / 重置预算与状态 |
+| `cf.risk.report` / `cf.risk.reset` | 熔断快照 / 重置预算与状态（保留隧道记录） |
+
+对应的 REST 入口：`GET /api/v1/cf/slots`、`GET /api/v1/cf/matrix/status`、`GET /api/v1/cf/egress/status`、`POST /api/v1/cf/tunnel/provision`、`POST /api/v1/cf/tunnel/teardown`（同 Bearer 校验）。
+
+## T0 协同（Egress Matrix / Instabox）
+
+- **槽位绑定**：每个账号静态绑定 `slot-001…slot-250` 中的一个槽位，`egressPort = 24000 + index`（24001–24250）。`proxyPort` 必须与槽位端口一致，重复槽位直接 `ERR_SLOT_TAKEN`；`nextFreePort` 从第一个空槽位顺延。
+- **STRICT_CONTROL 出网**：所有请求（CONNECT 与明文 HTTP）注入 `Proxy-Authorization: Basic base64("<slot>:STRICT_CONTROL")`、`X-OC-Routing-Plane: STRICT_CONTROL`、`X-OC-Matrix-Slot: <slot>`。
+- **fail-closed**：配置了 egress 状态源（本地总线或注入的 `getEgressState`）后，每次请求前重新读取快照。槽位为 `WARP_OVERFLOW` / `ROTATING` / `QUARANTINED` / 缺失 / 快照不可用，一律抛 `ERR_EGRESS_UNSAFE_FOR_CF_CONTROL`（HTTP 503），**不发出任何字节，也不回退直连**。
+- **换血联动**：WS 收到 `PRE_ROTATION_FREEZE` 立即销毁该槽位全部连接池并自动回 `ACK_FREEZE`；`POST_ROTATION_RESUME` 到达后更新 `egressFingerprint` 再恢复。总线未安装时矩阵按无 egress 模式工作，面板显示 `EGRESS-BUS OFF`。
+- **多态部署**：`cf.worker.deploy` 默认按 Cloudflare 账号注入确定性 banner / 校验死代码，逻辑相同但 SHA-256 不同；隧道与脚本名经 `generateSafeResourceName` 过滤 `edgetunnel/vless/proxy/scan` 等字样。
+- **Instabox 隧道**：`cf.tunnel.provision` 幂等复用或创建 Tunnel，写入 ingress，创建代理 CNAME，tunnel token 以 AES-256-GCM 密封后存入 `state.tunnels`，返回值包含 `tunnelToken` 与 `cfRay`。
 
 ## 风控基线
 
@@ -161,11 +189,12 @@ node test/panel-host-server.js
 # 浏览器打开 http://127.0.0.1:4599/test/panel-host.html
 ```
 
-包含：加密落盘、20 并发状态写、8 进程跨进程写、20 并发预算抢占（5 成功 / 15 拒绝）、429 冷却与选号漂移、403 隔离、关闭端口 fail-closed、真实 TCP 探活 + 固定指纹、multipart 校验、密钥不匹配拒绝、apiBase 越界 URL 拒绝、种子账号 `matrix.ready` 时序。
+包含：加密落盘、20 并发状态写、8 进程跨进程写、20 并发预算抢占（5 成功 / 15 拒绝）、429 冷却与选号漂移、403 隔离、关闭端口 fail-closed、真实 TCP 探活 + 固定指纹、multipart 校验、密钥不匹配拒绝、apiBase 越界 URL 拒绝、种子账号 `matrix.ready` 时序；T0 另含多态哈希差异（同逻辑不同 SHA-256、去敏资源名）、槽位 1:1 契约、`WARP_OVERFLOW` fail-closed、`PRE_ROTATION_FREEZE` 排空、`cf.tunnel.provision` 全契约与 token 密封。
 
 ## 与设计稿的差异
 
 1. **CommonJS**：与 instabox 扩展及 OpenChamber host 的加载方式一致；未使用 ESM。
 2. **不直接 `import undici`**：当前安装模型不暴露 undici，网络层复用 `lib/proxy-fetch.js`（零依赖 CONNECT/TLS 实现）。`keepAliveTimeout`/`maxConnections` 以“连接槽位 + 空闲回收”实现等价约束。
-3. **IPv6 /64**：作为账号绑定元数据写入 vault 并随绑定状态暴露；实际出口由 sing-box 入站决定。Node 侧只认本地端口，仍然 fail-closed。
+3. **IPv6 /64**：作为槽位出口指纹（`egressFingerprint.ipv6Prefix64`）写入 vault 并随槽位状态暴露；实际出口由 Egress Matrix 的 lease 决定。Node 侧只认本地槽位端口，仍然 fail-closed。
 4. **凭证仓拆成两个文件**：`cf-accounts.json`（静态资料 + 密封凭证，低频写）与 `cf-accounts-state.json`（状态/预算/健康分，高频写）。两者都走 `withStateLock`，降低高频写时暴露密文的窗口。
+5. **Egress 安全检查的条件启用**：未安装 `openchamber-egress-matrix`（无总线、无注入状态源）时，矩阵保持旧的端口绑定语义可用；一旦接入状态源，槽位安全检查即对每个请求强制执行。

@@ -16,7 +16,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
-const { once } = require('node:events');
+const crypto = require('node:crypto');
+const { once, EventEmitter } = require('node:events');
 const { spawn } = require('node:child_process');
 
 const {
@@ -25,6 +26,13 @@ const {
   buildMultipart,
   normalizeConfig,
   headerValue,
+  polymorphWorkerScript,
+  isPolymorphized,
+  generateSafeResourceName,
+  resourceNameIsSafe,
+  matrixSlotIdForPort,
+  egressPortForSlotId,
+  controlAuthorization,
   RiskError,
   ProxyUnavailableError,
 } = require('../index');
@@ -481,6 +489,299 @@ async function main() {
       matrix.client.requestOnce('alpha', 'https://evil.example/collect'),
       (error) => error.code === 'ERR_URL_SCOPE',
     );
+  });
+
+  await check('polymorph: same logic, distinct deployment hash and safe names', async () => {
+    const source = 'export default { fetch() { return new Response("ok"); } }';
+    const accountA = 'a'.repeat(32);
+    const accountB = 'b'.repeat(32);
+    const deployedA = polymorphWorkerScript(source, accountA);
+    const deployedB = polymorphWorkerScript(source, accountB);
+    assert.equal(isPolymorphized(deployedA), true);
+    assert.equal(isPolymorphized(deployedB), true);
+    const sha = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+    assert.notEqual(sha(deployedA), sha(deployedB), 'polymorph output is identical across accounts');
+    assert.equal(deployedA.includes('new Response("ok")'), true);
+
+    const safe = generateSafeResourceName('edgetunnel-vless-proxy-scan-vm1', 'slot-002');
+    assert.equal(resourceNameIsSafe(safe), true);
+    for (const banned of ['edgetunnel', 'vless', 'proxy', 'scan']) {
+      assert.equal(safe.toLowerCase().includes(banned), false, `${banned} leaked into "${safe}"`);
+    }
+  });
+
+  await check('slot contract: 1:1 port mapping and strict-control credentials', async () => {
+    assert.equal(matrixSlotIdForPort(24001), 'slot-001');
+    assert.equal(matrixSlotIdForPort(24250), 'slot-250');
+    assert.equal(matrixSlotIdForPort(24000), null);
+    assert.equal(matrixSlotIdForPort(24251), null);
+    assert.equal(egressPortForSlotId('slot-250'), 24250);
+    assert.equal(
+      controlAuthorization('slot-001'),
+      `Basic ${Buffer.from('slot-001:STRICT_CONTROL').toString('base64')}`,
+    );
+    const alpha = matrix.vault.get('alpha');
+    assert.equal(alpha.matrixSlotId, 'slot-001');
+    assert.equal(alpha.egressPort, 24001);
+    await assert.rejects(
+      matrix.vault.add({
+        id: 'mismatch',
+        label: 'mismatch',
+        authType: 'token',
+        token: 'cf-token-mismatch-abcdefghijklmnopqrstuvwxyz-0123',
+        proxyPort: 24002,
+        matrixSlotId: 'slot-003',
+      }),
+      (error) => error.code === 'ERR_PROFILE',
+    );
+  });
+
+  await check('WARP_OVERFLOW fails closed and PRE_ROTATION_FREEZE drains the pool', async () => {
+    const t0Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-matrix-t0-'));
+    let health = 'WARP_OVERFLOW';
+    const sent = [];
+    const transports = [];
+    const egressSlots = () => ({
+      slots: [
+        {
+          matrixSlotId: 'slot-222',
+          egressPort: 24222,
+          routingPlane: 'STRICT_CONTROL',
+          healthState: health,
+          leaseId: 'lease-1',
+          egressFingerprint: {
+            exitIp: '203.0.113.7',
+            ipv6Prefix64: '2001:db8:1::/64',
+            asn: 13335,
+            leaseId: 'lease-1',
+            updatedAt: Date.now(),
+          },
+        },
+      ],
+    });
+    const busEvents = new EventEmitter();
+    const fakeBus = {
+      enabled: true,
+      events: busEvents,
+      getEgressState: egressSlots,
+      start() {},
+      stop() {},
+      status: () => ({ enabled: true, connected: true }),
+    };
+    const listener = net.createServer((socket) => socket.end());
+    await new Promise((resolve) => listener.listen(24222, '127.0.0.1', resolve));
+    const t0 = createMatrix({
+      dataDir: t0Dir,
+      masterKey: MASTER_KEY,
+      config,
+      egressBus: fakeBus,
+      createTransport: (port, transportOptions) => {
+        const transport = {
+          port,
+          options: transportOptions,
+          state: 'open',
+          drainCalls: 0,
+          async fetch(input, init) {
+            sent.push({ port, input, init });
+            return fakeResponse();
+          },
+          drain() {
+            this.drainCalls += 1;
+          },
+          close() {},
+          quarantine() {},
+          release() {},
+          isQuarantined() {
+            return false;
+          },
+        };
+        transports.push(transport);
+        return transport;
+      },
+      sleep: () => Promise.resolve(),
+    });
+    try {
+      await t0.vault.add({
+        id: 'slot1',
+        label: 'slot1',
+        authType: 'token',
+        token: 'cf-token-slot1-abcdefghijklmnopqrstuvwxyz-01234567',
+        proxyPort: 24222,
+      });
+      await assert.rejects(
+        t0.net.request('slot1', 'https://api.cloudflare.com/client/v4/user'),
+        (error) => {
+          assert.equal(error.code, 'ERR_EGRESS_UNSAFE_FOR_CF_CONTROL');
+          assert.equal(error.matrixSlotId, 'slot-222');
+          assert.equal(error.healthState, 'WARP_OVERFLOW');
+          return true;
+        },
+      );
+      assert.equal(sent.length, 0, 'request escaped while the slot was in WARP_OVERFLOW');
+
+      health = 'ACTIVE';
+      const response = await t0.net.request('slot1', 'https://api.cloudflare.com/client/v4/user');
+      assert.equal(response.status, 200);
+      assert.equal(sent.length, 1);
+      const transport = transports[transports.length - 1];
+      assert.equal(transport.options.proxyAuth, controlAuthorization('slot-222'));
+      assert.equal(transport.options.routingHeaders['x-oc-matrix-slot'], 'slot-222');
+      assert.equal(transport.options.routingHeaders['x-oc-routing-plane'], 'STRICT_CONTROL');
+
+      busEvents.emit('freeze', {
+        type: 'PRE_ROTATION_FREEZE',
+        matrixSlotId: 'slot-222',
+        eventId: 'evt-1',
+      });
+      assert.equal(transport.drainCalls, 1, 'PRE_ROTATION_FREEZE did not drain the slot pool');
+      const resumed = await t0.net.request('slot1', 'https://api.cloudflare.com/client/v4/user');
+      assert.equal(resumed.status, 200);
+
+      health = 'ROTATING';
+      await assert.rejects(
+        t0.net.request('slot1', 'https://api.cloudflare.com/client/v4/user'),
+        (error) => error.code === 'ERR_EGRESS_UNSAFE_FOR_CF_CONTROL',
+      );
+    } finally {
+      t0.close();
+      listener.close();
+      fs.rmSync(t0Dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
+
+  await check('cf.tunnel.provision returns the full instabox contract and seals the token', async () => {
+    const tunnelDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-matrix-tunnel-'));
+    const listener = net.createServer((socket) => socket.end());
+    await new Promise((resolve) => listener.listen(24010, '127.0.0.1', resolve));
+    const routes = [];
+    let dnsCreated = false;
+    const createTransport = (port) => ({
+      port,
+      state: 'open',
+      async fetch(input, init) {
+        const url = new URL(String(input));
+        const method = String(init.method || 'GET').toUpperCase();
+        const at = url.pathname;
+        routes.push(`${method} ${at}${url.search}`);
+        const reply = (body, status = 200) => fakeResponse({ status, body });
+        if (method === 'GET' && at.endsWith('/zones')) {
+          return reply({
+            success: true,
+            result: [{ id: 'zone-1', name: 'example.com', status: 'active' }],
+          });
+        }
+        if (method === 'POST' && /\/cfd_tunnel$/.test(at)) {
+          return reply({
+            success: true,
+            result: { id: 'tun-1', name: 'instabox-vm1', token: 'tunnel-token-1' },
+          });
+        }
+        if (method === 'GET' && /\/cfd_tunnel$/.test(at)) {
+          return reply({ success: true, result: [] });
+        }
+        if (method === 'PUT' && at.endsWith('/configurations')) {
+          return reply({ success: true, result: { config: JSON.parse(String(init.body)).config } });
+        }
+        if (method === 'GET' && at.endsWith('/dns_records')) {
+          return reply({
+            success: true,
+            result: dnsCreated
+              ? [
+                  {
+                    id: 'rec-1',
+                    name: 'vm1.example.com',
+                    type: 'CNAME',
+                    content: 'tun-1.cfargotunnel.com',
+                  },
+                ]
+              : [],
+          });
+        }
+        if (method === 'POST' && at.endsWith('/dns_records')) {
+          dnsCreated = true;
+          const body = JSON.parse(String(init.body));
+          return reply({ success: true, result: { id: 'rec-1', ...body } });
+        }
+        if (method === 'DELETE' && at.endsWith('/dns_records/rec-1')) {
+          dnsCreated = false;
+          return reply({ success: true, result: { id: 'rec-1' } });
+        }
+        return reply({ success: true, result: { id: 'tun-1' } });
+      },
+      drain() {},
+      close() {},
+      quarantine() {},
+      release() {},
+      isQuarantined() {
+        return false;
+      },
+    });
+    const tunneled = createMatrix({
+      dataDir: tunnelDir,
+      masterKey: MASTER_KEY,
+      config: { ...config, risk: { ...config.risk, windowLimit: 950 } },
+      createTransport,
+      sleep: () => Promise.resolve(),
+    });
+    try {
+      await tunneled.vault.add({
+        id: 'slot10',
+        label: 'slot10',
+        authType: 'token',
+        token: 'cf-token-slot10-abcdefghijklmnopqrstuvwxyz-0123456',
+        cloudflareAccountId: 'c'.repeat(32),
+        proxyPort: 24010,
+      });
+      const result = await tunneled.rpc.handle('cf.tunnel.provision', {
+        matrixSlotId: 'slot-010',
+        vmInstanceId: 'vm1',
+        localPort: 8080,
+        domainZone: 'example.com',
+        tunnelName: 'instabox-vm1',
+        publicHostname: 'vm1.example.com',
+      });
+      assert.equal(result.matrixSlotId, 'slot-010');
+      assert.equal(result.egressPort, 24010);
+      assert.equal(result.tunnelId, 'tun-1');
+      assert.equal(result.tunnelToken, 'tunnel-token-1');
+      assert.equal(result.publicHostname, 'vm1.example.com');
+      assert.equal(result.cfRay, 'selfcheck-LHR');
+      assert.equal(result.dns.created.length, 1);
+      assert.ok(
+        routes.some(
+          (line) =>
+            line.startsWith('POST ') &&
+            line.includes(`/accounts/${'c'.repeat(32)}/cfd_tunnel`),
+        ),
+        `tunnel create route missing: ${routes.join(' | ')}`,
+      );
+      assert.ok(
+        routes.some((line) => line.startsWith('POST ') && line.includes('/zones/zone-1/dns_records')),
+        `dns create route missing: ${routes.join(' | ')}`,
+      );
+
+      const state = tunneled.vault.state('slot10');
+      const record = state.tunnels['tun-1'];
+      assert.ok(record, 'tunnel record was not stored');
+      assert.ok(record.sealedToken && record.sealedToken.startsWith('v1.'), 'token was not sealed');
+      assert.equal(JSON.stringify(state).includes('tunnel-token-1'), false);
+      assert.equal(record.matrixSlotId, 'slot-010');
+      assert.equal(record.publicHostname, 'vm1.example.com');
+
+      const slots = await tunneled.rpc.handle('cf.matrix.slots', {});
+      const slot10 = slots.find((slot) => slot.matrixSlotId === 'slot-010');
+      assert.ok(slot10, 'slot-010 missing from cf.matrix.slots');
+      assert.equal(slot10.tunnels[0].tunnelId, 'tun-1');
+
+      const torn = await tunneled.rpc.handle('cf.tunnel.teardown', { tunnelId: 'tun-1' });
+      assert.equal(torn.deleted, true);
+      assert.equal(torn.dnsDeleted, 1);
+      assert.equal(tunneled.vault.state('slot10').tunnels['tun-1'], undefined);
+    } finally {
+      tunneled.close();
+      listener.close();
+      fs.rmSync(tunnelDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
   });
 
   matrix.close();

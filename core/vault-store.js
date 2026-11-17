@@ -24,6 +24,11 @@ const path = require('node:path');
 const os = require('node:os');
 
 const { withStateLock, atomicWriteJson } = require('../lib/store-lock');
+const {
+  indexForSlotId,
+  matrixSlotIdForPort,
+  egressPortForSlotId,
+} = require('./contract');
 
 const VAULT_FILE = 'cf-accounts.json';
 const STATE_FILE = 'cf-accounts-state.json';
@@ -47,6 +52,9 @@ const DEFAULT_STATE = Object.freeze({
   failureCount: 0,
   budget: { buckets: [], tokens: null, lastRefillAt: 0 },
   zones: {},
+  matrixSlotId: null,
+  egressFingerprint: null,
+  tunnels: {},
 });
 
 class VaultError extends Error {
@@ -239,6 +247,8 @@ function publicProfile(account) {
     cloudflareAccountId: account.cloudflareAccountId || null,
     tags: Array.isArray(account.tags) ? [...account.tags] : [],
     proxyPort: account.proxyPort,
+    matrixSlotId: account.matrixSlotId || matrixSlotIdForPort(account.proxyPort),
+    egressPort: account.egressPort || null,
     egressIpv6: account.egressIpv6 || null,
     enabled: account.enabled !== false,
     createdAt: account.createdAt,
@@ -276,6 +286,33 @@ function normalizeProfile(input, existing) {
     throw new VaultError('ERR_PROFILE', 'proxyPort must be an integer between 1 and 65535');
   }
 
+  /*
+   * 1:1 egress binding: every matrix port (24001..24250) belongs to exactly one
+   * slot (slot-001..slot-250). The slot can be given explicitly, otherwise it is
+   * derived from the port, and the two must always agree.
+   */
+  const requestedSlot =
+    input.matrixSlotId !== undefined ? input.matrixSlotId : existing?.matrixSlotId;
+  let matrixSlotId = requestedSlot === null || requestedSlot === undefined
+    ? null
+    : String(requestedSlot).trim();
+  if (matrixSlotId === '') matrixSlotId = null;
+  if (matrixSlotId && indexForSlotId(matrixSlotId) === null) {
+    throw new VaultError('ERR_PROFILE', `matrixSlotId "${matrixSlotId}" is not in slot-001..slot-250`);
+  }
+  if (!matrixSlotId) matrixSlotId = matrixSlotIdForPort(proxyPort);
+  const egressPort = matrixSlotId ? egressPortForSlotId(matrixSlotId) : null;
+  let finalPort = proxyPort;
+  if (egressPort !== null) {
+    if (input.proxyPort !== undefined && Number(input.proxyPort) !== egressPort) {
+      throw new VaultError(
+        'ERR_PROFILE',
+        `proxyPort must equal egressPort ${egressPort} for ${matrixSlotId}`,
+      );
+    }
+    finalPort = egressPort;
+  }
+
   const egressIpv6 = String(input.egressIpv6 ?? existing?.egressIpv6 ?? '').trim();
   if (egressIpv6 && !/^[0-9A-Fa-f:]{2,39}\/\d{1,3}$/.test(egressIpv6)) {
     throw new VaultError('ERR_PROFILE', 'egressIpv6 must look like 2001:db8::/64');
@@ -293,7 +330,9 @@ function normalizeProfile(input, existing) {
     authType,
     email: email || null,
     tags,
-    proxyPort,
+    proxyPort: finalPort,
+    matrixSlotId,
+    egressPort,
     egressIpv6: egressIpv6 || null,
     cloudflareAccountId: cloudflareAccountId || null,
     enabled: input.enabled === undefined ? existing?.enabled !== false : Boolean(input.enabled),
@@ -441,6 +480,7 @@ function createVault(options = {}) {
       data.accounts[id] = { ...JSON.parse(JSON.stringify(DEFAULT_STATE)), id };
       return data.accounts[id];
     }
+    if (!existing.tunnels || typeof existing.tunnels !== 'object') existing.tunnels = {};
     return existing;
   }
 
@@ -486,6 +526,15 @@ function createVault(options = {}) {
         if (taken) {
           throw new VaultError('ERR_PORT_TAKEN', `proxy port ${profile.proxyPort} is already bound`);
         }
+        if (profile.matrixSlotId) {
+          const slotTaken = Object.values(data.accounts).some(
+            (account) =>
+              (account.matrixSlotId || matrixSlotIdForPort(account.proxyPort)) === profile.matrixSlotId,
+          );
+          if (slotTaken) {
+            throw new VaultError('ERR_SLOT_TAKEN', `egress slot ${profile.matrixSlotId} is already bound`);
+          }
+        }
         const token = input.token ? String(input.token).trim() : '';
         const apiKey = input.apiKey ? String(input.apiKey).trim() : '';
         if (profile.authType === 'token' && !token) {
@@ -517,6 +566,16 @@ function createVault(options = {}) {
             (account) => account.id !== existing.id && account.proxyPort === profile.proxyPort,
           );
           if (taken) throw new VaultError('ERR_PORT_TAKEN', `proxy port ${profile.proxyPort} is taken`);
+        }
+        if (profile.matrixSlotId) {
+          const slotTaken = Object.values(data.accounts).some(
+            (account) =>
+              account.id !== existing.id &&
+              (account.matrixSlotId || matrixSlotIdForPort(account.proxyPort)) === profile.matrixSlotId,
+          );
+          if (slotTaken) {
+            throw new VaultError('ERR_SLOT_TAKEN', `egress slot ${profile.matrixSlotId} is taken`);
+          }
         }
         Object.assign(existing, profile);
         if (patch.token !== undefined) {
@@ -553,6 +612,8 @@ function createVault(options = {}) {
         authType: account.authType,
         email: account.email,
         proxyPort: account.proxyPort,
+        matrixSlotId: account.matrixSlotId || matrixSlotIdForPort(account.proxyPort),
+        egressPort: account.egressPort || null,
         egressIpv6: account.egressIpv6,
         cloudflareAccountId: account.cloudflareAccountId,
         token: account.token ? unseal(key, account.token, `${account.id}:token`) : null,

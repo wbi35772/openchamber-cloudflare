@@ -33,6 +33,8 @@ const { createRiskEngine } = require('./core/risk-engine');
 const { createNetBinder } = require('./core/net-binder');
 const { createCfClient } = require('./core/cf-client');
 const { createRpcHandler, serializeError } = require('./bridge/rpc-handler');
+const { createEgressBus } = require('./core/egress-bus');
+const { egressPortForIndex } = require('./core/contract');
 
 const VERSION = require('./package.json').version;
 
@@ -79,6 +81,29 @@ function createMatrix(options = {}) {
   });
   vault.open();
 
+  /*
+   * Egress bus wiring.
+   *
+   * The library stays usable without the egress matrix (tests, offline CLI),
+   * but the host service enables the bus so every Cloudflare call is pinned to
+   * the STRICT_CONTROL plane and fails closed when a slot is rotating.
+   */
+  const busOption = options.egressBus;
+  let bus = null;
+  let getEgressState =
+    typeof options.getEgressState === 'function' ? options.getEgressState : undefined;
+  if (busOption && typeof busOption === 'object' && typeof busOption.getEgressState === 'function') {
+    bus = busOption;
+    getEgressState = () => bus.getEgressState();
+  } else if (busOption === true) {
+    bus = createEgressBus({
+      url: options.egressBusUrl || config.egressBusUrl,
+      clientId: options.egressClientId,
+      autoAck: true,
+    });
+    getEgressState = () => bus.getEgressState();
+  }
+
   const risk = createRiskEngine({
     vault,
     config,
@@ -96,8 +121,25 @@ function createMatrix(options = {}) {
     maxConnections: options.maxConnections,
     keepAliveTimeoutMs: options.keepAliveTimeoutMs,
     createTransport: options.createTransport,
+    getEgressState,
     onQuarantine: (event) => events.emit('quarantine', event),
   });
+
+  if (bus) {
+    bus.events.on('freeze', (event) => {
+      const drained = net ? net.drainSlot(event.matrixSlotId) : null;
+      events.emit('egress-freeze', { ...event, drained });
+    });
+    bus.events.on('resume', (event) => events.emit('egress-resume', event));
+    bus.events.on('connected', () => events.emit('egress-connected'));
+    bus.events.on('disconnected', () => events.emit('egress-disconnected'));
+    bus.events.on('state', (state) => events.emit('egress-state', state));
+    try {
+      bus.start();
+    } catch {
+      /* the bus reconnects on its own; bindings fail closed until then */
+    }
+  }
 
   const client = createCfClient({
     vault,
@@ -122,6 +164,7 @@ function createMatrix(options = {}) {
     risk,
     net,
     client,
+    bus,
     config,
     saveConfig,
     configPath,
@@ -131,12 +174,26 @@ function createMatrix(options = {}) {
     nextFreePort,
   });
 
+  /*
+   * Slot-first allocation: ports 24001..24250 belong to slot-001..slot-250, so
+   * a new account always lands on the first unbound egress slot. Ports outside
+   * the matrix range stay available for legacy/non-egress accounts.
+   */
   function nextFreePort() {
-    const used = new Set(vault.list().map((account) => account.proxyPort));
+    const used = new Set(vault.list().map((account) => Number(account.proxyPort)));
+    if (config.portStart <= 24250 && config.portEnd >= 24001) {
+      const first = Math.max(1, config.portStart - 24000);
+      const last = Math.min(250, config.portEnd - 24000);
+      for (let index = first; index <= last; index += 1) {
+        const port = egressPortForIndex(index);
+        if (!used.has(port)) return port;
+      }
+    }
     for (let port = config.portStart; port <= config.portEnd; port += 1) {
+      if (port >= 24001 && port <= 24250) continue;
       if (!used.has(port)) return port;
     }
-    throw new Error(`no free proxy port in ${config.portStart}-${config.portEnd}`);
+    throw new Error(`no free egress port in ${config.portStart}-${config.portEnd}`);
   }
 
   async function bootstrap(accounts = []) {
@@ -155,6 +212,13 @@ function createMatrix(options = {}) {
   }
 
   function close() {
+    if (bus) {
+      try {
+        bus.stop();
+      } catch {
+        /* ignore stop failure */
+      }
+    }
     net.closeAll();
     events.removeAllListeners();
   }
@@ -171,6 +235,7 @@ function createMatrix(options = {}) {
     risk,
     net,
     client,
+    bus,
     rpc,
     events,
     bootstrap,
@@ -188,6 +253,11 @@ function createMatrix(options = {}) {
         masterKeyPath: vault.masterKeyPath,
         accounts: vault.list(),
         bindings: net.status(),
+        egress: {
+          enabled: Boolean(bus),
+          status: bus && typeof bus.status === 'function' ? bus.status() : null,
+          state: net.egressSnapshot(),
+        },
       };
     },
   };
@@ -261,9 +331,10 @@ function usage() {
     '  status',
     '  accounts',
     '  account add --label L (--token T | --token-stdin | --token-env VAR)',
-    '              [--id ID] [--proxy-port P] [--tags a,b] [--cloudflare-account-id ID]',
+    '              [--id ID] [--proxy-port P] [--matrix-slot slot-001] [--tags a,b]',
+    '              [--cloudflare-account-id ID]',
     '  account add --label L --auth-type key --email E --api-key K',
-    '  account update <id> [--label L] [--token T] [--proxy-port P] [--tags a,b]',
+    '  account update <id> [--label L] [--token T] [--proxy-port P] [--matrix-slot slot-001]',
     '                    [--enabled true|false] [--cloudflare-account-id ID]',
     '  account remove <id>',
     '  verify <id>',
@@ -377,6 +448,7 @@ async function dispatch(matrix, flags, command, args) {
       email: flags.email,
       cloudflareAccountId: flags['cloudflare-account-id'],
       tags: flags.tags,
+      matrixSlotId: flags['matrix-slot'],
       enabled: flags.disabled ? false : true,
     };
     if (flags['proxy-port'] !== undefined) params.proxyPort = Number(flags['proxy-port']);
@@ -396,6 +468,7 @@ async function dispatch(matrix, flags, command, args) {
     }
     if (flags.email !== undefined) patch.email = String(flags.email);
     if (flags['proxy-port'] !== undefined) patch.proxyPort = Number(flags['proxy-port']);
+    if (flags['matrix-slot'] !== undefined) patch.matrixSlotId = String(flags['matrix-slot']);
     if (flags.tags !== undefined) patch.tags = flags.tags;
     if (flags['cloudflare-account-id'] !== undefined) {
       patch.cloudflareAccountId = String(flags['cloudflare-account-id']);
@@ -501,5 +574,8 @@ module.exports = {
   ...require('./core/risk-engine'),
   ...require('./core/net-binder'),
   ...require('./core/cf-client'),
+  ...require('./core/contract'),
+  ...require('./core/polymorph'),
+  ...require('./core/egress-bus'),
   ...require('./bridge/rpc-handler'),
 };

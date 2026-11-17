@@ -10,6 +10,16 @@
 
 const crypto = require('node:crypto');
 const { RiskError } = require('./risk-engine');
+const {
+  indexForSlotId,
+  egressPortForSlotId,
+} = require('./contract');
+const {
+  polymorphWorkerScript,
+  polymorphDigest,
+  generateSafeResourceName,
+  resourceNameIsSafe,
+} = require('./polymorph');
 
 const MIN_QUOTA_DEFAULT = 5;
 const DNS_TYPES = new Set(['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'SRV', 'CAA', 'PTR']);
@@ -533,9 +543,11 @@ function createCfClient(options = {}) {
     if (!name) throw new CfApiError('tunnelName is required', { code: 'ERR_TUNNEL_NAME' });
 
     let tunnel = null;
+    let cfRay = null;
     const listed = await call(profile.id, `accounts/${cfAccountId}/cfd_tunnel`, {
       query: { name, is_deleted: false, per_page: 20 },
     });
+    cfRay = listed.cfRay || cfRay;
     tunnel = (listed.body?.result || []).find((entry) => entry.name === name) || null;
 
     if (!tunnel) {
@@ -543,6 +555,7 @@ function createCfClient(options = {}) {
         method: 'POST',
         body: { name, config_src: options.configSrc || 'cloudflare' },
       });
+      cfRay = created.cfRay || cfRay;
       tunnel = created.body?.result;
     }
 
@@ -551,15 +564,21 @@ function createCfClient(options = {}) {
       ingress.push({ service: 'http_status:404' });
     }
     if (ingress.length) {
-      await call(profile.id, `accounts/${cfAccountId}/cfd_tunnel/${tunnel.id}/configurations`, {
-        method: 'PUT',
-        body: { config: { ingress } },
-      });
+      const configured = await call(
+        profile.id,
+        `accounts/${cfAccountId}/cfd_tunnel/${tunnel.id}/configurations`,
+        {
+          method: 'PUT',
+          body: { config: { ingress } },
+        },
+      );
+      cfRay = configured.cfRay || cfRay;
     }
 
     let token = tunnel.token || null;
     if (!token) {
       const tokenResponse = await call(profile.id, `accounts/${cfAccountId}/cfd_tunnel/${tunnel.id}/token`);
+      cfRay = tokenResponse.cfRay || cfRay;
       token = tokenResponse.body?.result || null;
     }
 
@@ -570,6 +589,7 @@ function createCfClient(options = {}) {
       name: tunnel.name,
       token,
       ingress,
+      cfRay,
     };
   }
 
@@ -587,6 +607,19 @@ function createCfClient(options = {}) {
     };
     if (options.compatibilityFlags) metadata.compatibility_flags = options.compatibilityFlags;
 
+    /*
+     * Polymorphic deployment: the same logical module is wrapped with a
+     * deterministic banner + checksum tail derived from the Cloudflare account
+     * id, so repeated deploys across the matrix never share a SHA-256 while the
+     * runtime behaviour stays identical.
+     */
+    const source = Buffer.isBuffer(code) ? code.toString('utf8') : String(code);
+    const polymorph = options.polymorph !== false;
+    const deployedCode = polymorph ? polymorphWorkerScript(source, cfAccountId) : source;
+    const digest = polymorph
+      ? polymorphDigest(source, cfAccountId)
+      : crypto.createHash('sha256').update(source, 'utf8').digest('hex');
+
     const multipart = buildMultipart([
       {
         name: 'metadata',
@@ -597,7 +630,7 @@ function createCfClient(options = {}) {
         name: filename,
         filename,
         contentType: options.contentType || 'application/javascript+module',
-        value: Buffer.isBuffer(code) ? code : Buffer.from(String(code), 'utf8'),
+        value: Buffer.from(deployedCode, 'utf8'),
       },
     ]);
 
@@ -612,6 +645,9 @@ function createCfClient(options = {}) {
       cloudflareAccountId: cfAccountId,
       script: response.body?.result?.id || name,
       etag: response.headers.get('etag') || null,
+      cfRay: response.cfRay || null,
+      polymorph,
+      digest,
     };
   }
 
@@ -622,6 +658,248 @@ function createCfClient(options = {}) {
       query: { is_deleted: false, per_page: options.perPage || 50 },
     });
     return response.body?.result || [];
+  }
+
+  function findSlotAccount(matrixSlotId) {
+    const slotId = String(matrixSlotId || '').trim();
+    if (indexForSlotId(slotId) === null) {
+      throw new CfApiError(`invalid matrixSlotId "${slotId}"`, { code: 'ERR_SLOT_INVALID' });
+    }
+    const profile = vault
+      .list()
+      .find((account) => (account.matrixSlotId || null) === slotId);
+    if (!profile) {
+      throw new CfApiError(`no Cloudflare account is bound to ${slotId}`, { code: 'ERR_SLOT_UNBOUND' });
+    }
+    if (profile.enabled === false) {
+      throw new CfApiError(`account "${profile.label}" is disabled`, {
+        code: 'ERR_ACCOUNT_DISABLED',
+        accountId: profile.id,
+      });
+    }
+    return profile;
+  }
+
+  /*
+   * cf.tunnel.provision: the business-layer contract with openchamber-instabox.
+   * One slot -> one tunnel -> one proxied CNAME. The tunnel token is returned
+   * once to the caller and stored sealed (AES-256-GCM) inside the vault state.
+   */
+  async function provisionTunnelForSlot(params = {}) {
+    const profile = findSlotAccount(params.matrixSlotId);
+    const matrixSlotId = profile.matrixSlotId;
+    const domainZone = String(params.domainZone || '').trim().toLowerCase();
+    if (!domainZone) throw new CfApiError('domainZone is required', { code: 'ERR_DOMAIN_ZONE' });
+    const vmInstanceId = String(params.vmInstanceId || '').trim();
+    if (!vmInstanceId) throw new CfApiError('vmInstanceId is required', { code: 'ERR_VM_INSTANCE' });
+    const localPort = Number(params.localPort ?? 8080);
+    if (!Number.isInteger(localPort) || localPort < 1 || localPort > 65535) {
+      throw new CfApiError('localPort must be an integer between 1 and 65535', {
+        code: 'ERR_LOCAL_PORT',
+      });
+    }
+
+    const state = vault.state(profile.id) || {};
+    const reusable = Object.values(state.tunnels || {}).find(
+      (entry) =>
+        entry &&
+        entry.matrixSlotId === matrixSlotId &&
+        entry.vmInstanceId === vmInstanceId &&
+        entry.domainZone === domainZone,
+    );
+
+    const tunnelName = String(
+      params.tunnelName ||
+        reusable?.tunnelName ||
+        generateSafeResourceName(`${vmInstanceId}-${domainZone}`, matrixSlotId),
+    ).trim();
+    if (!resourceNameIsSafe(tunnelName)) {
+      throw new CfApiError(`tunnelName "${tunnelName}" is not a safe resource name`, {
+        code: 'ERR_TUNNEL_NAME',
+      });
+    }
+    const publicHostname = String(
+      params.publicHostname || reusable?.publicHostname || `${tunnelName}.${domainZone}`,
+    ).toLowerCase();
+    if (publicHostname !== domainZone && !publicHostname.endsWith(`.${domainZone}`)) {
+      throw new CfApiError(`publicHostname must live under ${domainZone}`, {
+        code: 'ERR_HOSTNAME_ZONE',
+      });
+    }
+
+    const ingress = [
+      { hostname: publicHostname, service: `http://127.0.0.1:${localPort}` },
+      ...(Array.isArray(params.ingress) ? params.ingress : []),
+    ];
+
+    const tunnel = await provisionZeroTrustTunnel(profile.id, tunnelName, ingress, {
+      cloudflareAccountId: params.cloudflareAccountId,
+    });
+
+    const dns = await ensureZoneAndDns(
+      profile.id,
+      domainZone,
+      [
+        {
+          type: 'CNAME',
+          name: publicHostname,
+          content: `${tunnel.tunnelId}.cfargotunnel.com`,
+          proxied: true,
+          ttl: 1,
+          comment: `instabox:${vmInstanceId}`,
+        },
+      ],
+      {
+        cloudflareAccountId: tunnel.cloudflareAccountId,
+        createZone: params.createZone !== false,
+      },
+    );
+
+    const sealedToken = tunnel.token
+      ? await vault.seal(tunnel.token, `${profile.id}:tunnel:${tunnel.tunnelId}`)
+      : null;
+    const record = {
+      tunnelId: tunnel.tunnelId,
+      tunnelName,
+      matrixSlotId,
+      egressPort: egressPortForSlotId(matrixSlotId),
+      vmInstanceId,
+      localPort,
+      domainZone,
+      zoneId: dns.zoneId,
+      cloudflareAccountId: tunnel.cloudflareAccountId,
+      publicHostname,
+      cfRay: tunnel.cfRay || null,
+      sealedToken,
+      createdAt: reusable?.createdAt || now(),
+      updatedAt: now(),
+    };
+    await vault.mutateState(profile.id, (next) => {
+      next.tunnels = next.tunnels || {};
+      next.tunnels[tunnel.tunnelId] = record;
+      return next;
+    });
+
+    return {
+      matrixSlotId,
+      egressPort: record.egressPort,
+      accountId: profile.id,
+      tunnelId: tunnel.tunnelId,
+      tunnelToken: tunnel.token,
+      tunnelName,
+      publicHostname,
+      localPort,
+      vmInstanceId,
+      cfRay: tunnel.cfRay || null,
+      dns: { created: dns.created, updated: dns.updated, unchanged: dns.unchanged },
+    };
+  }
+
+  async function teardownTunnel(params = {}) {
+    const tunnelId = String(params.tunnelId || '').trim();
+    if (!tunnelId) throw new CfApiError('tunnelId is required', { code: 'ERR_TUNNEL_ID' });
+
+    let profile = null;
+    let record = null;
+    for (const candidate of vault.list()) {
+      const state = vault.state(candidate.id) || {};
+      if (state.tunnels && state.tunnels[tunnelId]) {
+        profile = candidate;
+        record = state.tunnels[tunnelId];
+        break;
+      }
+    }
+    if (!profile && params.matrixSlotId) profile = findSlotAccount(params.matrixSlotId);
+    if (!profile) {
+      throw new CfApiError(`tunnel "${tunnelId}" is not known to the vault`, {
+        code: 'ERR_TUNNEL_NOT_FOUND',
+      });
+    }
+
+    const cfAccountId = await resolveCfAccountId(profile.id, {
+      cloudflareAccountId: params.cloudflareAccountId || record?.cloudflareAccountId,
+    });
+
+    let deleted = false;
+    try {
+      await call(profile.id, `accounts/${cfAccountId}/cfd_tunnel/${tunnelId}`, {
+        method: 'DELETE',
+        query: { cascade: 'true' },
+      });
+      deleted = true;
+    } catch (error) {
+      if (!(error instanceof CfApiError) || error.status !== 404) throw error;
+    }
+
+    let dnsDeleted = 0;
+    if (record?.zoneId && record?.publicHostname) {
+      const listed = await listDnsRecords(profile.id, record.zoneId, {
+        name: record.publicHostname,
+        perPage: 100,
+      });
+      for (const entry of listed) {
+        if (entry.name !== record.publicHostname) continue;
+        await deleteDnsRecord(profile.id, record.zoneId, entry.id);
+        dnsDeleted += 1;
+      }
+    }
+
+    await vault.mutateState(profile.id, (state) => {
+      if (state.tunnels) delete state.tunnels[tunnelId];
+      return state;
+    });
+
+    return {
+      matrixSlotId: record?.matrixSlotId || null,
+      accountId: profile.id,
+      tunnelId,
+      deleted,
+      dnsDeleted,
+    };
+  }
+
+  function matrixSlots() {
+    const states = new Map(vault.states().map((state) => [state.id, state]));
+    const slots = vault.list().map((account) => {
+      const state = states.get(account.id) || {};
+      const riskSnapshot = risk.snapshot(account.id);
+      const matrixSlotId = account.matrixSlotId || null;
+      return {
+        matrixSlotId,
+        egressPort:
+          account.egressPort || (matrixSlotId ? egressPortForSlotId(matrixSlotId) : null),
+        accountId: account.id,
+        label: account.label,
+        enabled: account.enabled !== false,
+        authType: account.authType,
+        proxyPort: account.proxyPort,
+        tags: [...(account.tags || [])],
+        cloudflareAccountId: account.cloudflareAccountId || null,
+        status: state.status || 'ACTIVE',
+        cooldownUntil: state.cooldownUntil || 0,
+        quarantineReason: state.quarantineReason || null,
+        healthScore: state.healthScore ?? 100,
+        lastRay: state.lastRay || null,
+        lastUsedAt: state.lastUsedAt || 0,
+        successCount: state.successCount || 0,
+        failureCount: state.failureCount || 0,
+        window: riskSnapshot.window,
+        zones: Object.keys(state.zones || {}),
+        tunnels: Object.values(state.tunnels || {}).map((entry) => ({
+          tunnelId: entry.tunnelId,
+          tunnelName: entry.tunnelName,
+          vmInstanceId: entry.vmInstanceId,
+          publicHostname: entry.publicHostname,
+          localPort: entry.localPort,
+          createdAt: entry.createdAt,
+          updatedAt: entry.updatedAt,
+        })),
+      };
+    });
+    slots.sort((a, b) =>
+      String(a.matrixSlotId || 'slot-999').localeCompare(String(b.matrixSlotId || 'slot-999')),
+    );
+    return slots;
   }
 
   return {
@@ -639,6 +917,9 @@ function createCfClient(options = {}) {
     deleteDnsRecord,
     resolveCfAccountId,
     provisionZeroTrustTunnel,
+    provisionTunnelForSlot,
+    teardownTunnel,
+    matrixSlots,
     deployWorkerScript,
     listTunnels,
     get apiBase() {

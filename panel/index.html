@@ -7,50 +7,38 @@
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <div id="app">
-    <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true">
-          <span></span><span></span><span></span>
-        </div>
-        <div class="brand-text">
-          <strong>CF MATRIX</strong>
-          <em>多账号通道</em>
-        </div>
-      </div>
-      <div class="topbar-actions">
-        <span class="conn" id="conn"><i></i><span>连接中</span></span>
-        <button class="ghost-btn" data-act="settings" title="运行参数">设置</button>
-        <button class="primary-btn" data-act="add-account" title="添加 Cloudflare 账号">
-          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-          添加账号
-        </button>
-      </div>
-    </header>
+  <header class="topbar">
+    <div class="brand">OC <span>//</span> CLOUDFLARE-MATRIX</div>
 
-    <section class="stats" id="stats"></section>
+    <div class="badges">
+      <span class="badge" id="badge-egress"><i></i>EGRESS-BUS</span>
+      <span class="badge" id="badge-instabox"><i></i>INSTABOX</span>
+      <span class="badge" id="badge-host"><i></i>HOST</span>
+    </div>
 
-    <section class="toolbar">
-      <div class="filter">
-        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input id="filter-input" type="search" placeholder="过滤账号 / 标签 / 端口" autocomplete="off" />
-      </div>
-      <div class="toolbar-meta">
-        <button class="ghost-btn small" data-act="refresh" title="刷新">刷新</button>
-        <span id="toolbar-meta"></span>
-      </div>
-    </section>
+    <nav class="filters" id="filters" aria-label="槽位过滤">
+      <button class="filter active" data-filter="ALL" type="button">ALL</button>
+      <button class="filter" data-filter="ACTIVE" type="button">ACTIVE</button>
+      <button class="filter" data-filter="COOLDOWN" type="button">COOLDOWN</button>
+      <button class="filter" data-filter="QUARANTINED" type="button">QUARANTINED</button>
+    </nav>
 
-    <main id="grid" class="grid" aria-live="polite"></main>
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-add" type="button">+ 新增槽位账号</button>
+      <button class="btn" id="btn-verify" type="button">全量验活</button>
+      <button class="btn" id="btn-deploy" type="button">多态部署 Worker</button>
+    </div>
+  </header>
 
-    <footer class="footer">
-      <span id="footer-status">等待连接…</span>
-      <span class="footer-hint" id="footer-hint">凭证只存在于本机加密仓，面板不显示明文</span>
-    </footer>
-  </div>
+  <main id="grid" class="grid" aria-live="polite"></main>
 
-  <div id="toast-root" class="toast-root"></div>
+  <footer class="statusline">
+    <span id="conn-text">连接中…</span>
+    <span id="last-sync"></span>
+  </footer>
+
   <div id="modal-root"></div>
+  <div id="toast-root" class="toasts"></div>
 
   <script src="./main.js"></script>
 </body>

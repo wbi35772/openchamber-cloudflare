@@ -17,6 +17,8 @@ const PATCHABLE = new Set([
   'apiBase',
   'proxyHost',
   'proxyAuth',
+  'egressBusUrl',
+  'routingPlane',
   'portStart',
   'portEnd',
   'probe',

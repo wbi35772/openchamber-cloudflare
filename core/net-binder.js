@@ -17,6 +17,16 @@
 
 const net = require('node:net');
 const { createProxyFetch } = require('../lib/proxy-fetch');
+const {
+  indexForSlotId,
+  matrixSlotIdForPort,
+  egressPortForSlotId,
+  controlAuthorization,
+  strictControlHeaders,
+  isEgressSafeForControl,
+  normalizeFingerprint,
+  unsafeEgress,
+} = require('./contract');
 
 const DEFAULT_KEEPALIVE_MS = 30000;
 const DEFAULT_MAX_CONNECTIONS = 5;
@@ -121,9 +131,72 @@ function createNetBinder(options = {}) {
   const onQuarantine = typeof options.onQuarantine === 'function' ? options.onQuarantine : () => {};
   const createTransport =
     typeof options.createTransport === 'function' ? options.createTransport : createProxyFetch;
+  const getEgressState =
+    typeof options.getEgressState === 'function' ? options.getEgressState : null;
 
   const bindings = new Map();
   const probes = new Map();
+
+  function slotRecord(matrixSlotId, egressPort) {
+    if (!matrixSlotId) return null;
+    const state = getEgressState ? getEgressState() : null;
+    const slots = state && Array.isArray(state.slots) ? state.slots : [];
+    return slots.find((entry) => entry && entry.matrixSlotId === matrixSlotId) || null;
+  }
+
+  /*
+   * Cloudflare control traffic (the only traffic this extension produces) may
+   * never leave through a slot that is mid-rotation, quarantined, or spilling
+   * into shared WARP. When an egress state source is configured, every request
+   * re-checks the live snapshot before a single byte is sent.
+   */
+  function assertSlotSafe(binding) {
+    if (!getEgressState) return null;
+    if (!binding.matrixSlotId) {
+      throw unsafeEgress({
+        matrixSlotId: 'slot-???',
+        egressPort: binding.proxyPort,
+        reason: `account ${binding.accountId} is not bound to a matrix slot`,
+      });
+    }
+    const state = getEgressState();
+    if (!state || typeof state !== 'object') {
+      throw unsafeEgress({
+        matrixSlotId: binding.matrixSlotId,
+        egressPort: binding.proxyPort,
+        reason: 'egress matrix state is unavailable',
+      });
+    }
+    const slots = Array.isArray(state.slots) ? state.slots : [];
+    const slot = slots.find((entry) => entry && entry.matrixSlotId === binding.matrixSlotId);
+    if (!slot) {
+      throw unsafeEgress({
+        matrixSlotId: binding.matrixSlotId,
+        egressPort: binding.proxyPort,
+        reason: 'slot is missing from the egress snapshot',
+      });
+    }
+    if (!isEgressSafeForControl(slot.healthState)) {
+      throw unsafeEgress({
+        matrixSlotId: binding.matrixSlotId,
+        egressPort: binding.proxyPort,
+        healthState: slot.healthState,
+        reason: 'slot health state forbids control traffic',
+      });
+    }
+    if (
+      slot.routingPlane &&
+      String(slot.routingPlane).toUpperCase() !== 'STRICT_CONTROL'
+    ) {
+      throw unsafeEgress({
+        matrixSlotId: binding.matrixSlotId,
+        egressPort: binding.proxyPort,
+        healthState: slot.healthState,
+        reason: `slot is leased to ${slot.routingPlane}`,
+      });
+    }
+    return slot;
+  }
 
   function bind(accountId) {
     const account = getAccount(accountId);
@@ -146,12 +219,40 @@ function createNetBinder(options = {}) {
 
     const existing = bindings.get(account.id);
     const proxyHost = currentHost();
-    if (existing && existing.proxyPort === proxyPort && existing.proxyHost === proxyHost) return existing;
+    const explicitSlot = account.matrixSlotId ? String(account.matrixSlotId) : null;
+    const matrixSlotId = explicitSlot || matrixSlotIdForPort(proxyPort);
+    let egressPort = null;
+    if (matrixSlotId) {
+      if (indexForSlotId(matrixSlotId) === null) {
+        throw new BindingError('ERR_SLOT_INVALID', `account "${account.id}" has invalid matrixSlotId "${matrixSlotId}"`, {
+          accountId: account.id,
+        });
+      }
+      egressPort = egressPortForSlotId(matrixSlotId);
+      if (egressPort !== proxyPort) {
+        throw new BindingError(
+          'ERR_SLOT_PORT_MISMATCH',
+          `slot ${matrixSlotId} is bound to port ${egressPort}, account "${account.id}" uses ${proxyPort}`,
+          { accountId: account.id, proxyPort },
+        );
+      }
+    }
+    if (
+      existing &&
+      existing.proxyPort === proxyPort &&
+      existing.proxyHost === proxyHost &&
+      existing.matrixSlotId === matrixSlotId
+    ) {
+      assertSlotSafe(existing);
+      return existing;
+    }
     if (existing) close(account.id);
 
+    const slotBound = Boolean(matrixSlotId);
     const transport = createTransport(proxyPort, {
       proxyHost,
-      proxyAuth: currentProxyAuth(),
+      proxyAuth: slotBound ? controlAuthorization(matrixSlotId) : currentProxyAuth(),
+      routingHeaders: slotBound ? strictControlHeaders(matrixSlotId) : undefined,
       timeoutMs: config.http?.timeoutMs || 30000,
       failClosed: true,
       onQuarantine: (reason) => onQuarantine({ accountId: account.id, proxyPort, reason }),
@@ -160,6 +261,8 @@ function createNetBinder(options = {}) {
     const binding = {
       accountId: account.id,
       label: account.label,
+      matrixSlotId,
+      egressPort,
       proxyPort,
       proxyHost,
       egressIpv6: account.egressIpv6 || null,
@@ -171,7 +274,10 @@ function createNetBinder(options = {}) {
       lastUsedAt: 0,
       requests: 0,
       failures: 0,
+      drainCount: 0,
+      lastDrainedAt: 0,
     };
+    assertSlotSafe(binding);
     bindings.set(account.id, binding);
     return binding;
   }
@@ -227,6 +333,7 @@ function createNetBinder(options = {}) {
 
   async function probeEgress(accountId, options = {}) {
     const binding = bind(accountId);
+    assertSlotSafe(binding);
     const probeTimeoutMs = config.probe?.timeoutMs ?? 5000;
     await ensureReachable(binding, { force: true });
     const url = options.url || config.probe?.url;
@@ -255,6 +362,7 @@ function createNetBinder(options = {}) {
 
   async function request(accountId, input, init = {}) {
     const binding = bind(accountId);
+    assertSlotSafe(binding);
     await ensureReachable(binding);
     await binding.slots.acquire();
     binding.requests += 1;
@@ -297,21 +405,122 @@ function createNetBinder(options = {}) {
     probes.clear();
   }
 
+  /*
+   * PRE_ROTATION_FREEZE handler: drop every pooled connection of one slot, but
+   * leave the binding registered so POST_ROTATION_RESUME can continue on the
+   * fresh lease without re-reading the vault.
+   */
+  function drainSlot(matrixSlotId) {
+    const slot = String(matrixSlotId || '');
+    const targets = [];
+    for (const binding of bindings.values()) {
+      if (binding.matrixSlotId === slot) targets.push(binding.accountId);
+    }
+    let drained = 0;
+    for (const accountId of targets) {
+      const binding = bindings.get(accountId);
+      if (!binding) continue;
+      if (typeof binding.transport.drain === 'function') {
+        try {
+          binding.transport.drain();
+        } catch {
+          /* ignore drain failure: the transport gets rebuilt on demand */
+        }
+        binding.drainCount += 1;
+        binding.lastDrainedAt = now();
+        drained += 1;
+        continue;
+      }
+      try {
+        binding.transport.close();
+      } catch {
+        /* ignore close failure */
+      }
+      if (binding.idleTimer) clearTimeout(binding.idleTimer);
+      bindings.delete(accountId);
+      probes.delete(binding.proxyPort);
+      drained += 1;
+    }
+    return { matrixSlotId: slot, drained };
+  }
+
+  function drainAll() {
+    const slots = new Set();
+    for (const binding of bindings.values()) {
+      if (binding.matrixSlotId) slots.add(binding.matrixSlotId);
+    }
+    let drained = 0;
+    for (const slot of slots) drained += drainSlot(slot).drained;
+    return { drained, slots: [...slots] };
+  }
+
+  function slotForAccount(accountId) {
+    const profile = getAccount(accountId);
+    if (!profile) return null;
+    const proxyPort = Number(profile.proxyPort);
+    const matrixSlotId = profile.matrixSlotId || matrixSlotIdForPort(proxyPort);
+    if (!matrixSlotId) return null;
+    return {
+      accountId: profile.id,
+      matrixSlotId,
+      egressPort: egressPortForSlotId(matrixSlotId),
+    };
+  }
+
+  function egressSnapshot() {
+    if (!getEgressState) return null;
+    try {
+      return getEgressState();
+    } catch {
+      return null;
+    }
+  }
+
+  function slotStatus(matrixSlotId) {
+    if (!matrixSlotId) return null;
+    const slot = slotRecord(String(matrixSlotId), null);
+    if (!slot) return null;
+    let fingerprint = null;
+    try {
+      fingerprint = slot.egressFingerprint ? normalizeFingerprint(slot.egressFingerprint) : null;
+    } catch {
+      fingerprint = null;
+    }
+    return {
+      matrixSlotId: slot.matrixSlotId,
+      egressPort: slot.egressPort,
+      routingPlane: slot.routingPlane || null,
+      healthState: slot.healthState || null,
+      leaseId: slot.leaseId || null,
+      egressFingerprint: fingerprint,
+    };
+  }
+
   function status() {
-    return [...bindings.values()].map((binding) => ({
-      accountId: binding.accountId,
-      label: binding.label,
-      proxyPort: binding.proxyPort,
-      egressIpv6: binding.egressIpv6,
-      activeSlots: binding.slots.active,
-      pendingSlots: binding.slots.pending,
-      maxConnections,
-      requests: binding.requests,
-      failures: binding.failures,
-      lastUsedAt: binding.lastUsedAt,
-      transportState: binding.transport.state,
-      probe: probes.get(binding.proxyPort) || null,
-    }));
+    return [...bindings.values()].map((binding) => {
+      const slot = slotStatus(binding.matrixSlotId);
+      return {
+        accountId: binding.accountId,
+        label: binding.label,
+        matrixSlotId: binding.matrixSlotId,
+        egressPort: binding.egressPort,
+        proxyPort: binding.proxyPort,
+        egressIpv6: binding.egressIpv6,
+        healthState: slot ? slot.healthState : null,
+        routingPlane: slot ? slot.routingPlane : null,
+        egressFingerprint: slot ? slot.egressFingerprint : null,
+        activeSlots: binding.slots.active,
+        pendingSlots: binding.slots.pending,
+        maxConnections,
+        requests: binding.requests,
+        failures: binding.failures,
+        drainCount: binding.drainCount,
+        lastDrainedAt: binding.lastDrainedAt,
+        lastUsedAt: binding.lastUsedAt,
+        transportState: binding.transport.state,
+        probe: probes.get(binding.proxyPort) || null,
+      };
+    });
   }
 
   function invalidateProbe(accountId) {
@@ -327,6 +536,11 @@ function createNetBinder(options = {}) {
       return ensureReachable(bind(accountId), options);
     },
     invalidateProbe,
+    drainSlot,
+    drainAll,
+    slotForAccount,
+    slotStatus,
+    egressSnapshot,
     close,
     closeAll,
     status,

@@ -26,7 +26,7 @@ if (!PORT || !TOKEN) {
 
 let matrix;
 try {
-  matrix = createMatrix();
+  matrix = createMatrix({ egressBus: true });
 } catch (error) {
   process.stderr.write(`cf-matrix-channel: startup failed: ${error.message}\n`);
   process.exit(1);
@@ -87,6 +87,53 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/status') {
       const result = await matrix.rpc.handle('cf.matrix.status', {});
       send(res, 200, { ok: true, result });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/v1/cf/slots') {
+      const result = await matrix.rpc.handle('cf.matrix.slots', {});
+      send(res, 200, { ok: true, result });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/v1/cf/matrix/status') {
+      const result = await matrix.rpc.handle('cf.matrix.status', {});
+      send(res, 200, { ok: true, result });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/v1/cf/egress/status') {
+      const result = await matrix.rpc.handle('cf.egress.status', {});
+      send(res, 200, { ok: true, result });
+      return;
+    }
+
+    if (
+      req.method === 'POST' &&
+      (url.pathname === '/api/v1/cf/tunnel/provision' ||
+        url.pathname === '/api/v1/cf/tunnel/teardown')
+    ) {
+      const raw = await readBody(req);
+      let params = {};
+      if (raw.trim()) {
+        try {
+          const parsed = JSON.parse(raw);
+          params = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+        } catch {
+          send(res, 400, { ok: false, error: { code: 'ERR_JSON', message: 'body is not valid JSON' } });
+          return;
+        }
+      }
+      const method =
+        url.pathname === '/api/v1/cf/tunnel/provision'
+          ? 'cf.tunnel.provision'
+          : 'cf.tunnel.teardown';
+      try {
+        const result = await matrix.rpc.handle(method, params);
+        send(res, 200, { ok: true, result });
+      } catch (error) {
+        send(res, 200, { ok: false, error: serializeError(error) });
+      }
       return;
     }
 

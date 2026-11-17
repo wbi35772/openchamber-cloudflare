@@ -59,12 +59,106 @@
         return config.portStart;
       }
 
+      function slots() {
+        return accounts.map(function (a) {
+          var port = a.proxyPort;
+          var slotId = a.matrixSlotId || ('slot-' + String(port - 24000).padStart(3, '0'));
+          var snap = snapshots[a.id] || {};
+          return {
+            matrixSlotId: slotId,
+            egressPort: port,
+            accountId: a.id,
+            label: a.label,
+            enabled: a.enabled !== false,
+            authType: 'token',
+            proxyPort: port,
+            tags: a.tags || [],
+            cloudflareAccountId: null,
+            status: snap.status || 'ACTIVE',
+            cooldownUntil: 0,
+            quarantineReason: null,
+            healthScore: snap.healthScore || 100,
+            lastRay: '9f2c1d7e8a3b4c5d',
+            lastUsedAt: Date.now() - 30000,
+            successCount: 42,
+            failureCount: 1,
+            window: snap.window || { used: 0, limit: 950 },
+            zones: ['example.com'],
+            tunnels: a.id === 'acc_demo'
+              ? [{
+                  tunnelId: 'tun-demo',
+                  tunnelName: 'instabox-vm1',
+                  vmInstanceId: 'vm1',
+                  publicHostname: 'vm1.example.com',
+                  localPort: 8080,
+                  domainZone: 'example.com',
+                  createdAt: Date.now() - 600000,
+                  updatedAt: Date.now(),
+                }]
+              : [],
+            egress: {
+              matrixSlotId: slotId,
+              egressPort: port,
+              routingPlane: 'STRICT_CONTROL',
+              healthState: 'ACTIVE',
+              leaseId: 'lease-' + slotId,
+              egressFingerprint: {
+                exitIp: '203.0.113.7',
+                ipv6Prefix64: '2001:db8:1::/64',
+                asn: 13335,
+                leaseId: 'lease-' + slotId,
+                updatedAt: Date.now(),
+              },
+            },
+          };
+        });
+      }
+
       function rpc(method, params) {
         window.__METHODS.push(method);
         window.__CALLS.push({ method: method, params: params });
         switch (method) {
+          case 'cf.matrix.slots':
+            return slots();
           case 'cf.matrix.status':
-            return { dataDir: 'C:\\Users\\demo\\.openchamber-cf-matrix-channel', configPath: 'C:\\Users\\demo\\.openchamber-cf-matrix-channel\\cf-matrix.config.json', masterKeySource: 'generated', masterKeyPath: 'C:\\Users\\demo\\.openchamber-cf-matrix-channel\\master.key', version: '0.1.0' };
+            return {
+              apiBase: config.apiBase,
+              portRange: [config.portStart, config.portEnd],
+              accounts: accounts.length,
+              egress: {
+                enabled: true,
+                status: { connected: true, baseUrl: 'http://127.0.0.1:19880' },
+                state: { slots: slots().map(function (slot) { return slot.egress; }) },
+              },
+              slots: slots(),
+            };
+          case 'cf.slot.drain':
+            return { matrixSlotId: params.matrixSlotId, drained: 2 };
+          case 'cf.slot.rotate':
+            return { matrixSlotId: params.matrixSlotId, drained: { drained: 2 }, rotation: { accepted: true } };
+          case 'cf.tunnel.provision':
+            return {
+              matrixSlotId: params.matrixSlotId,
+              egressPort: 24001,
+              accountId: 'acc_demo',
+              tunnelId: 'tun-demo',
+              tunnelToken: 'demo-token',
+              tunnelName: params.tunnelName || 'instabox-vm1',
+              publicHostname: params.publicHostname || 'vm1.example.com',
+              localPort: params.localPort || 8080,
+              vmInstanceId: params.vmInstanceId || 'vm1',
+              cfRay: '9f2c1d7e8a3b4c5d',
+              dns: { created: [], updated: [], unchanged: [] },
+            };
+          case 'cf.worker.deploy':
+            return {
+              accountId: 'acc_demo',
+              script: params.scriptName,
+              etag: 'etag-demo',
+              polymorph: true,
+              digest: 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+              cfRay: '9f2c1d7e8a3b4c5d',
+            };
           case 'cf.account.list':
             return { accounts: accounts.slice() };
           case 'cf.risk.report':
@@ -75,10 +169,13 @@
             config = Object.assign({}, config, params || {});
             return { config: config, configPath: 'C:\\Users\\demo\\config.json' };
           case 'cf.account.add': {
+            var port = params.proxyPort || nextPort();
             var profile = {
               id: 'acc_' + (accounts.length + 1),
               label: params.label,
-              proxyPort: params.proxyPort || nextPort(),
+              proxyPort: port,
+              matrixSlotId: params.matrixSlotId || ('slot-' + String(port - 24000).padStart(3, '0')),
+              egressPort: port,
               tags: params.tags || [],
               enabled: params.enabled !== false,
             };

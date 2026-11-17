@@ -14,6 +14,13 @@
     },
     "proxyHost": { "type": "string", "minLength": 1, "default": "127.0.0.1" },
     "proxyAuth": { "type": ["string", "null"], "default": null },
+    "egressBusUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://",
+      "default": "http://127.0.0.1:19880"
+    },
+    "routingPlane": { "enum": ["STRICT_CONTROL", "ELASTIC_DATA"], "default": "STRICT_CONTROL" },
     "dataDir": { "type": "string" },
     "portStart": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 24001 },
     "portEnd": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 24250 },
@@ -93,7 +100,20 @@
           "cloudflareAccountId": { "type": "string", "pattern": "^[A-Fa-f0-9]{32}$" },
           "tags": { "type": "array", "items": { "type": "string", "maxLength": 32 }, "uniqueItems": true },
           "proxyPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "matrixSlotId": { "type": "string", "pattern": "^slot-[0-9]{3}$" },
+          "egressPort": { "type": "integer", "minimum": 24001, "maximum": 24250 },
           "egressIpv6": { "type": "string", "pattern": "^[A-Fa-f0-9:]+/[0-9]{1,3}$" },
+          "egressFingerprint": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "exitIp": { "type": ["string", "null"] },
+              "ipv6Prefix64": { "type": ["string", "null"] },
+              "asn": { "type": ["integer", "null"] },
+              "leaseId": { "type": ["string", "null"] },
+              "updatedAt": { "type": ["integer", "null"] }
+            }
+          },
           "enabled": { "type": "boolean" }
         }
       }
