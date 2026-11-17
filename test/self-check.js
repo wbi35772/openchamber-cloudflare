@@ -33,9 +33,11 @@ const {
   matrixSlotIdForPort,
   egressPortForSlotId,
   controlAuthorization,
+  createEgressBus,
   RiskError,
   ProxyUnavailableError,
 } = require('../index');
+const { atomicWriteJson } = require('../lib/store-lock');
 
 const MASTER_KEY = 'self-check-master-key-0123456789abcdef';
 const results = { passed: [], failed: [] };
@@ -782,6 +784,50 @@ async function main() {
       listener.close();
       fs.rmSync(tunnelDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
+  });
+
+  await check('store-lock retries atomic rename through EPERM/EBUSY', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-matrix-rename-'));
+    const target = path.join(dir, 'state.json');
+    const original = fs.renameSync;
+    let attempts = 0;
+    fs.renameSync = function (from, to) {
+      attempts += 1;
+      if (attempts <= 2) {
+        const error = new Error('transient rename failure');
+        error.code = attempts === 1 ? 'EPERM' : 'EBUSY';
+        throw error;
+      }
+      return original.call(fs, from, to);
+    };
+    try {
+      atomicWriteJson(target, { ok: true });
+    } finally {
+      fs.renameSync = original;
+    }
+    assert.equal(attempts, 3);
+    assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), { ok: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await check('egress bus cold start waits for the bus instead of throwing', async () => {
+    const bus = createEgressBus({
+      url: 'http://127.0.0.1:9',
+      stateTtlMs: 500,
+      connectTimeoutMs: 500,
+      reconnectScheduleMs: [1000, 2000, 5000],
+    });
+    try {
+      assert.equal(bus.status().connectionState, 'STOPPED');
+      assert.deepEqual(bus.status().reconnectScheduleMs, [1000, 2000, 5000]);
+      bus.start();
+      assert.equal(bus.status().connectionState, 'WAITING_EGRESS_BUS');
+      assert.equal(bus.status().waitingForBus, true);
+      assert.equal(bus.getControlState(), null);
+    } finally {
+      bus.stop();
+    }
+    assert.equal(bus.status().connectionState, 'STOPPED');
   });
 
   matrix.close();

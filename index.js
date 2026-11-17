@@ -94,14 +94,15 @@ function createMatrix(options = {}) {
     typeof options.getEgressState === 'function' ? options.getEgressState : undefined;
   if (busOption && typeof busOption === 'object' && typeof busOption.getEgressState === 'function') {
     bus = busOption;
-    getEgressState = () => bus.getEgressState();
+    getEgressState = () =>
+      typeof bus.getControlState === 'function' ? bus.getControlState() : bus.getEgressState();
   } else if (busOption === true) {
     bus = createEgressBus({
       url: options.egressBusUrl || config.egressBusUrl,
       clientId: options.egressClientId,
       autoAck: true,
     });
-    getEgressState = () => bus.getEgressState();
+    getEgressState = () => bus.getControlState();
   }
 
   const risk = createRiskEngine({

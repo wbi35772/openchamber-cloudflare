@@ -11,6 +11,118 @@
   var readyHandlers = new Set();
   var connected = false;
 
+  /* -------------------------------------------------- cross-extension probes */
+
+  var HEALTH_ENDPOINTS = {
+    egress: 'http://127.0.0.1:19880/api/v1/egress/bus-health',
+    instabox: 'http://127.0.0.1:19883/api/v1/instabox/bus-health',
+  };
+
+  (function configureHealthEndpoints() {
+    try {
+      var params = new URLSearchParams(window.location.search || '');
+      if (params.get('egressHealth')) HEALTH_ENDPOINTS.egress = String(params.get('egressHealth'));
+      if (params.get('instaboxHealth')) HEALTH_ENDPOINTS.instabox = String(params.get('instaboxHealth'));
+    } catch (error) {
+      /* very old hosts without URLSearchParams */
+    }
+    var override = window.__OC_HEALTH_ENDPOINTS;
+    if (override && typeof override === 'object') {
+      if (override.egress) HEALTH_ENDPOINTS.egress = String(override.egress);
+      if (override.instabox) HEALTH_ENDPOINTS.instabox = String(override.instabox);
+    }
+  })();
+
+  var health = { egress: null, instabox: null };
+
+  var timers = [];
+
+  function managedTimeout(fn, ms) {
+    var id = setTimeout(function () {
+      timers = timers.filter(function (entry) {
+        return entry !== id;
+      });
+      fn();
+    }, ms);
+    timers.push(id);
+    return id;
+  }
+
+  function managedInterval(fn, ms) {
+    var id = setInterval(fn, ms);
+    timers.push(id);
+    return id;
+  }
+
+  function clearManagedTimers() {
+    timers.forEach(function (id) {
+      clearTimeout(id);
+      clearInterval(id);
+    });
+    timers = [];
+  }
+
+  function probeHealth(url, timeoutMs) {
+    if (!url || typeof fetch !== 'function') return Promise.resolve(null);
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = managedTimeout(function () {
+      if (controller) controller.abort();
+    }, timeoutMs || 4000);
+    return fetch(url, {
+      method: 'GET',
+      mode: 'cors',
+      cache: 'no-store',
+      credentials: 'omit',
+      signal: controller ? controller.signal : undefined,
+    })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          var body = null;
+          try {
+            body = text ? JSON.parse(text) : null;
+          } catch (error) {
+            body = null;
+          }
+          return { ok: response.ok && (!body || body.ok !== false), body: body };
+        });
+      })
+      .catch(function () {
+        return null;
+      })
+      .then(function (result) {
+        clearTimeout(timer);
+        return result;
+      });
+  }
+
+  function refreshHealth() {
+    return Promise.all([
+      probeHealth(HEALTH_ENDPOINTS.egress),
+      probeHealth(HEALTH_ENDPOINTS.instabox),
+    ]).then(function (results) {
+      health.egress = results[0];
+      health.instabox = results[1];
+      renderBadges();
+      return health;
+    });
+  }
+
+  /* A missing cross-extension endpoint backs off instead of hammering a closed
+     port with a fetch every 10s. */
+  var healthFailures = 0;
+
+  function scheduleHealthPoll(delay) {
+    managedTimeout(function () {
+      refreshHealth()
+        .catch(function () {})
+        .then(function () {
+          var anyOk = (health.egress && health.egress.ok) || (health.instabox && health.instabox.ok);
+          healthFailures = anyOk ? 0 : Math.min(healthFailures + 1, 3);
+          scheduleHealthPoll(healthFailures === 0 ? 10000 : healthFailures === 1 ? 20000 : 60000);
+        });
+    }, delay);
+  }
+
   function post(type, payload, id) {
     var message = { channel: CHANNEL, v: WIRE, type: type };
     if (id !== undefined) message.id = id;
@@ -149,7 +261,7 @@
     node.className = 'toast' + (tone ? ' ' + tone : '');
     node.textContent = String(text);
     root.appendChild(node);
-    setTimeout(function () {
+    managedTimeout(function () {
       node.remove();
     }, 4200);
   }
@@ -279,20 +391,45 @@
     }, 0);
   }
 
-  function render() {
+  function renderBadges() {
     var egress = egressSummary();
-    setBadge(
-      'badge-egress',
-      egress.enabled ? (egress.connected ? 'on' : 'warn') : 'off',
-      'EGRESS-BUS' + (egress.enabled ? (egress.connected ? '' : ' WAIT') : ' OFF'),
-    );
-    if (egress.url) document.getElementById('badge-egress').title = egress.url;
+    var busHealth = health.egress;
+    var busBody = (busHealth && busHealth.body) || {};
+    if (busHealth && busHealth.ok) {
+      var busOnline = busBody.waitingForEgressBus !== true && busBody.connected !== false;
+      var busLabel = busBody.connectionState || busBody.egressBus || (busOnline ? 'ONLINE' : 'WAIT');
+      setBadge('badge-egress', busOnline ? 'on' : 'warn', 'EGRESS-BUS' + (busOnline ? '' : ' WAIT'));
+      document.getElementById('badge-egress').title =
+        'egress-matrix · ' + busLabel + ' · ' + HEALTH_ENDPOINTS.egress;
+    } else {
+      setBadge(
+        'badge-egress',
+        egress.enabled ? (egress.connected ? 'on' : 'warn') : 'off',
+        'EGRESS-BUS' + (egress.enabled ? (egress.connected ? '' : ' WAIT') : ' OFF'),
+      );
+      if (egress.url) document.getElementById('badge-egress').title = egress.url;
+    }
 
     var tunnels = tunnelCount();
-    setBadge('badge-instabox', tunnels > 0 ? 'on' : '', 'INSTABOX' + (tunnels ? ' ' + tunnels : ''));
-    document.getElementById('badge-instabox').title = tunnels
-      ? tunnels + ' 条 Instabox 隧道在线'
-      : '尚未签发 Instabox 隧道';
+    var boxHealth = health.instabox;
+    var boxBody = (boxHealth && boxHealth.body) || {};
+    if (boxHealth && boxHealth.ok) {
+      var boxTunnels = Number.isFinite(Number(boxBody.activeTunnels))
+        ? Number(boxBody.activeTunnels)
+        : tunnels;
+      setBadge('badge-instabox', 'on', 'INSTABOX' + (boxTunnels ? ' ' + boxTunnels : ''));
+      document.getElementById('badge-instabox').title =
+        'instabox · online · ' + HEALTH_ENDPOINTS.instabox;
+    } else {
+      setBadge('badge-instabox', tunnels > 0 ? 'on' : '', 'INSTABOX' + (tunnels ? ' ' + tunnels : ''));
+      document.getElementById('badge-instabox').title = tunnels
+        ? tunnels + ' 条 Instabox 隧道在线'
+        : '尚未签发 Instabox 隧道';
+    }
+  }
+
+  function render() {
+    renderBadges();
 
     var grid = document.getElementById('grid');
     var visible = state.slots.filter(function (slot) {
@@ -748,12 +885,13 @@
     if (window.parent !== window) {
       post('hello');
       setConn('连接中', '');
-      setTimeout(function () {
+      managedTimeout(function () {
         if (!connected) refresh().catch(function () {});
       }, 1600);
-      setInterval(function () {
+      managedInterval(function () {
         refresh().catch(function () {});
       }, 15000);
+      scheduleHealthPoll(800);
     } else {
       setConn('未嵌入', 'bad');
       document.getElementById('grid').innerHTML =
@@ -761,6 +899,9 @@
         '这个页面通过 openchamber.sdk 与本地服务通信，直接打开浏览器无法访问数据。</div>';
     }
   }
+
+  window.addEventListener('pagehide', clearManagedTimers);
+  window.addEventListener('beforeunload', clearManagedTimers);
 
   boot();
 })();

@@ -70,12 +70,85 @@ function readBody(req) {
   });
 }
 
+const CORS_HEADERS = Object.freeze({
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET, POST, OPTIONS',
+  'access-control-allow-headers':
+    'authorization, content-type, x-oc-routing-plane, x-oc-matrix-slot',
+  'access-control-max-age': '600',
+});
+
+async function busHealthPayload() {
+  const snapshot =
+    matrix.vault && typeof matrix.vault.snapshot === 'function'
+      ? matrix.vault.snapshot()
+      : { accounts: [] };
+  const accounts = Array.isArray(snapshot.accounts) ? snapshot.accounts : [];
+  const activeAccounts = accounts.filter(
+    (account) =>
+      account &&
+      account.enabled !== false &&
+      String(account.status || 'ACTIVE').toUpperCase() !== 'QUARANTINED',
+  ).length;
+
+  let slots = [];
+  try {
+    const result = await matrix.rpc.handle('cf.matrix.slots', {});
+    slots = Array.isArray(result) ? result : [];
+  } catch {
+    slots = [];
+  }
+
+  const now = Date.now();
+  let activeTunnels = 0;
+  let cooldownCount = 0;
+  for (const slot of slots) {
+    if (Array.isArray(slot.tunnels)) activeTunnels += slot.tunnels.length;
+    const status = String(slot.status || '').toUpperCase();
+    const egressHealth = String(slot.egress && slot.egress.healthState ? slot.egress.healthState : '').toUpperCase();
+    const cooling = Number(slot.cooldownUntil) > now;
+    if (cooling || egressHealth === 'COOLDOWN' || (status === 'COOLDOWN' && !Number(slot.cooldownUntil))) {
+      cooldownCount += 1;
+    }
+  }
+
+  const busStatus =
+    matrix.bus && typeof matrix.bus.status === 'function' ? matrix.bus.status() : null;
+  return {
+    ok: true,
+    service: 'cloudflare-matrix',
+    activeAccounts,
+    activeTunnels,
+    cooldownCount,
+    egressBus: busStatus
+      ? busStatus.connectionState || (busStatus.connected ? 'ONLINE' : 'WAITING_EGRESS_BUS')
+      : 'DISABLED',
+    waitingForEgressBus: Boolean(
+      busStatus && (busStatus.connectionState === 'WAITING_EGRESS_BUS' || busStatus.waitingForBus),
+    ),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 const server = http.createServer(async (req, res) => {
+  for (const [name, value] of Object.entries(CORS_HEADERS)) res.setHeader(name, value);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   try {
     const url = new URL(req.url || '/', `http://${HOST}:${PORT}`);
 
     if (req.method === 'GET' && url.pathname === '/health') {
       send(res, 200, { ok: true, name: 'cf-matrix-channel', version: matrix.version });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/v1/cf/bus-health') {
+      send(res, 200, await busHealthPayload());
       return;
     }
 

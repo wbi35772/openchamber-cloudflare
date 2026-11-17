@@ -310,6 +310,12 @@ function createEgressBus(options = {}) {
   const ackTimeoutMs = Math.max(100, Number(options.ackTimeoutMs) || 1500);
   const reconnectMinMs = Math.max(250, Number(options.reconnectMinMs) || 1000);
   const reconnectMaxMs = Math.max(reconnectMinMs, Number(options.reconnectMaxMs) || 15000);
+  const reconnectScheduleMs = (Array.isArray(options.reconnectScheduleMs)
+    ? options.reconnectScheduleMs
+    : [1000, 2000, 5000]
+  )
+    .map((value) => Math.max(250, Math.min(reconnectMaxMs, Number(value) || 0)))
+    .filter((value) => value > 0);
   const events = new EventEmitter();
 
   let started = false;
@@ -317,7 +323,8 @@ function createEgressBus(options = {}) {
   let socket = null;
   let reconnectTimer = null;
   let refreshTimer = null;
-  let reconnectDelay = reconnectMinMs;
+  let reconnectDelay = reconnectScheduleMs[0] || reconnectMinMs;
+  let reconnectAttempt = 0;
   let connecting = false;
   let lastMessageAt = 0;
   let cache = {
@@ -417,9 +424,11 @@ function createEgressBus(options = {}) {
 
   function scheduleReconnect() {
     if (stopped || reconnectTimer) return;
-    const base = reconnectDelay;
-    const jitter = Math.floor(Math.random() * 400);
-    reconnectDelay = Math.min(reconnectMaxMs, Math.round(reconnectDelay * 1.7));
+    const schedule = reconnectScheduleMs.length ? reconnectScheduleMs : [reconnectMinMs];
+    const base = schedule[Math.min(reconnectAttempt, schedule.length - 1)];
+    reconnectAttempt += 1;
+    reconnectDelay = base;
+    const jitter = Math.floor(Math.random() * 250);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect().catch(() => {});
@@ -497,7 +506,8 @@ function createEgressBus(options = {}) {
       const { socket: raw, head } = await connectWebSocket(wsUrl(), { timeoutMs: connectTimeoutMs });
       const active = new EgressSocket(raw, head);
       socket = active;
-      reconnectDelay = reconnectMinMs;
+      reconnectDelay = reconnectScheduleMs[0] || reconnectMinMs;
+      reconnectAttempt = 0;
       lastMessageAt = Date.now();
       events.emit('connected', { clientId, url: wsUrl() });
       active.on('event', (payload) => handleEvent(payload));
@@ -522,6 +532,8 @@ function createEgressBus(options = {}) {
     if (!enabled || started) return bus;
     started = true;
     stopped = false;
+    reconnectAttempt = 0;
+    reconnectDelay = reconnectScheduleMs[0] || reconnectMinMs;
     refreshState().catch(() => {});
     connect().catch(() => {});
     refreshTimer = setInterval(() => {
@@ -621,13 +633,37 @@ function createEgressBus(options = {}) {
     return cache.state;
   }
 
+  /*
+   * Live gate for STRICT_CONTROL traffic. A snapshot older than one failed
+   * refresh is not evidence that the bus is healthy, so it must not open the
+   * gate: the caller then fails closed with WAITING_EGRESS_BUS semantics.
+   */
+  function getControlState() {
+    if (!enabled) return null;
+    if (!cache.state || cache.stale) return null;
+    return cache.state;
+  }
+
+  function connectionState() {
+    if (!enabled) return 'DISABLED';
+    if (socket) return 'ONLINE';
+    if (started && !stopped) return 'WAITING_EGRESS_BUS';
+    return 'STOPPED';
+  }
+
   function status() {
+    const state = connectionState();
     return {
       enabled,
       clientId,
       baseUrl,
       connected: Boolean(socket),
       started,
+      connectionState: state,
+      waitingForBus: state === 'WAITING_EGRESS_BUS',
+      reconnectAttempt,
+      reconnectDelayMs: reconnectDelay,
+      reconnectScheduleMs: reconnectScheduleMs.slice(),
       lastMessageAt,
       stateUpdatedAt: cache.updatedAt,
       stateOk: cache.ok,
@@ -656,6 +692,7 @@ function createEgressBus(options = {}) {
     probeSlot,
     findSlot,
     getEgressState,
+    getControlState,
     status,
   };
 
