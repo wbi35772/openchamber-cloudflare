@@ -385,8 +385,14 @@
 
   /* ---------------------------------------------------------------- modals */
 
+  var modalEscape = null;
+
   function closeModal() {
     document.getElementById('modal-root').innerHTML = '';
+    if (modalEscape) {
+      document.removeEventListener('keydown', modalEscape);
+      modalEscape = null;
+    }
   }
 
   function fieldHtml(field) {
@@ -422,7 +428,7 @@
   function openModal(options) {
     var root = document.getElementById('modal-root');
     root.innerHTML =
-      '<div class="modal-backdrop" data-modal-close>' +
+      '<div class="modal-backdrop">' +
       '<div class="modal" role="dialog" aria-modal="true">' +
       '<h2>' + esc(options.title) + '</h2>' +
       '<p class="modal-sub">' + esc(options.subtitle || '') + '</p>' +
@@ -452,11 +458,12 @@
         closeModal();
       });
     });
-    document.addEventListener('keydown', function onEscape(event) {
+    if (modalEscape) document.removeEventListener('keydown', modalEscape);
+    modalEscape = function onEscape(event) {
       if (event.key !== 'Escape') return;
-      document.removeEventListener('keydown', onEscape);
       closeModal();
-    });
+    };
+    document.addEventListener('keydown', modalEscape);
 
     form.addEventListener('submit', function (event) {
       event.preventDefault();
